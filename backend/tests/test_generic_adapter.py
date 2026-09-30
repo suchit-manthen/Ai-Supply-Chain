@@ -1,0 +1,151 @@
+import io
+
+import pandas as pd
+import pytest
+
+from data_adapters import generic, storage
+
+
+def _frame(entities=("A", "B"), days=140, start="2024-01-01", **extra):
+    rows = []
+    base = pd.Timestamp(start)
+    for e in entities:
+        for i in range(days):
+            row = dict(date=base + pd.Timedelta(days=i), entity=e, sales=10 + (i % 5) + (0 if e == "A" else 3))
+            row.update(extra)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _write(path, df):
+    df.to_csv(path, index=False)
+    return path
+
+
+def test_profile_detects_renamed_schema(tmp_path):
+    df = _frame()
+    df = df.rename(columns={"date": "ds", "entity": "sku", "sales": "qty"})
+    df["store_id"] = 1
+    df["unit_price"] = 2.5
+    df["markdown"] = [0.1 if i % 7 == 0 else 0 for i in range(len(df))]
+    df["onpromotion"] = df["markdown"] > 0
+    df["temperature"] = 20.0
+    prof = generic.profile(_write(tmp_path / "a.csv", df))
+    m = prof["mapping"]
+    assert m["date"] == "ds"
+    assert m["sales"] == "qty"
+    assert m["product"] == "sku"
+    assert m["store"] == "store_id"
+    assert m["price"] == "unit_price"
+    assert m["discount"] == "markdown"
+    assert m["promo"] == "onpromotion"
+    assert m["temp"] == "temperature"
+    assert prof["required"]["satisfied"] is True
+
+
+def test_profile_minimal_required_only(tmp_path):
+    prof = generic.profile(_write(tmp_path / "b.csv", _frame()))
+    assert prof["required"]["satisfied"] is True
+    assert prof["mapping"]["date"] == "date"
+    assert prof["mapping"]["product"] == "entity"
+    assert prof["mapping"]["sales"] == "sales"
+    assert "price" not in prof["mapping"]
+    assert "discount" not in prof["mapping"]
+
+
+def test_profile_reports_missing_required_when_no_sales(tmp_path):
+    df = _frame().drop(columns=["sales"])
+    prof = generic.profile(_write(tmp_path / "c.csv", df))
+    assert prof["required"]["satisfied"] is False
+    assert prof["required"]["missing"] == ["sales"]
+
+
+def test_family_column_falls_back_to_entity(tmp_path):
+    rows = [dict(day=pd.Timestamp("2024-01-01") + pd.Timedelta(days=i), family="DAIRY", sales=5 + i % 3)
+            for i in range(140)]
+    prof = generic.profile(_write(tmp_path / "d.csv", pd.DataFrame(rows)))
+    assert prof["required"]["satisfied"] is True
+    assert prof["mapping"]["product"] == "family"
+    assert prof["mapping"]["category"] == "family"
+
+
+def test_date_not_confused_with_integer_id(tmp_path):
+    df = _frame()
+    df.insert(0, "id", range(len(df)))
+    prof = generic.profile(_write(tmp_path / "e.csv", df))
+    assert prof["mapping"]["date"] == "date"
+    assert prof["mapping"]["sales"] == "sales"
+
+
+def test_normalize_combines_store_and_aggregates_duplicates():
+    df = pd.DataFrame([
+        dict(date="2024-01-01", product="A", store="1", sales=2, promo=0),
+        dict(date="2024-01-01", product="A", store="1", sales=3, promo=1),
+        dict(date="2024-01-02", product="A", store="1", sales=4, promo=0),
+    ])
+    mapping = {"date": "date", "product": "product", "sales": "sales", "store": "store", "promo": "promo"}
+    out = generic.normalize(df, mapping)
+    assert set(out["product"]) == {"1|A"}
+    first = out[out.date == pd.Timestamp("2024-01-01")].iloc[0]
+    assert first.sales == 5        # duplicate rows summed
+    assert first.discount == 1     # promotion combined with OR/max
+    assert len(out) == 2
+
+
+def test_normalize_percent_discount_scaled():
+    df = pd.DataFrame([dict(date="2024-01-01", entity="A", sales=1, disc=20)])
+    out = generic.normalize(df, {"date": "date", "product": "entity", "sales": "sales", "discount": "disc"})
+    assert out.iloc[0].discount == pytest.approx(0.2)
+
+
+def test_normalize_missing_required_raises():
+    df = pd.DataFrame([dict(date="2024-01-01", entity="A", sales=1)])
+    with pytest.raises(ValueError, match="sales"):
+        generic.normalize(df, {"date": "date", "product": "entity"})
+
+
+def test_prepare_end_to_end_canonical(tmp_path):
+    df = _frame().rename(columns={"date": "ds", "entity": "sku", "sales": "qty"})
+    path = _write(tmp_path / "f.csv", df)
+    prof = generic.profile(path)
+    normalized, detected = generic.prepare(path, prof["mapping"], start_date="2024-01-01", end_date="2024-05-19")
+    out = pd.read_csv(io.BytesIO(normalized))
+    assert list(out.columns) == ["date", "product", "sales", "discount", "price", "temp", "holiday_lift", "stockout"]
+    assert detected["skus"] == 2
+    assert detected["rows"] == 280
+    assert (out["price"] > 0).all()
+
+
+def test_prepare_insufficient_history_raises(tmp_path):
+    path = _write(tmp_path / "g.csv", _frame(days=50))
+    prof = generic.profile(path)
+    with pytest.raises(ValueError, match="at least"):
+        generic.prepare(path, prof["mapping"])
+
+
+def test_upload_route_routes_to_generic(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    df = _frame().rename(columns={"date": "ds", "entity": "sku", "sales": "qty"})
+    path = _write(tmp_path / "h.csv", df)
+    import app as api
+    try:
+        with path.open("rb") as stream:
+            response = api.app.test_client().post(
+                "/api/upload", data={"file": (stream, "sales.csv")},
+                content_type="multipart/form-data")
+        result = response.get_json()
+        assert response.status_code == 200
+        assert result["adapter"] == "generic"
+        assert result["ok"] is True
+        assert result["profile"]["required"]["satisfied"] is True
+
+        prepared = api.app.test_client().post(
+            f"/api/generic/datasets/{result['dataset_id']}/prepare",
+            json={"mapping": result["profile"]["mapping"]})
+        pdata = prepared.get_json()
+        assert pdata["ok"] is True
+        assert pdata["detected"]["skus"] == 2
+    finally:
+        for csv in (tmp_path / "uploads").glob("*-generic.csv"):
+            generic.discard(csv.name.split("-generic.")[0])
+        monkeypatch.undo()

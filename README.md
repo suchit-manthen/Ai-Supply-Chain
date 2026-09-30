@@ -44,6 +44,12 @@ classic EOQ reference (`ORDERING_COST`, `HOLDING_RATE`).
 - **Favorita:** the first real-data adapter accepts the Kaggle
   `Corporación Favorita Grocery Sales Forecasting` `train.csv` columns
   `date, store_nbr, item_nbr, unit_sales` and optional `onpromotion`.
+- **Store + family:** a companion adapter accepts aggregated exports with columns
+  `date, store_nbr, family, sales` and optional `onpromotion` (for example the
+  `data/train.csv` store/category file). It streams the file in chunks, asks for
+  one store and up to eight product families, and normalizes the selection into
+  the same pipeline format. Missing sales rows are excluded and missing calendar
+  dates block training rather than being filled with zero.
 
 To try Favorita, choose **Upload CSV → Favorita train.csv**, select `train.csv`,
 then select one store, up to eight items, and a date range. The adapter scans the

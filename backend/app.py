@@ -11,7 +11,7 @@ from flask_cors import CORS
 
 import db
 import data_upload
-from data_adapters import favorita
+from data_adapters import favorita, generic, store_family
 import monitoring
 from config import SERVICE_LEVEL, UPLOAD_MIN_TRAIN_DAYS
 from inventory import service_z
@@ -133,6 +133,30 @@ def upload():
             return jsonify(ok=False, errors=[str(e)], warnings=[], detected={}, optional={}, preview=[])
         return jsonify(ok=True, adapter="favorita", dataset_id=dataset_id,
                        size_bytes=size, dataset=metadata)
+    if store_family.is_store_family_header(header):
+        try:
+            dataset_id, path, size = store_family.save_upload(f.stream)
+            metadata = store_family.inspect(path)
+            store_family.save_metadata(dataset_id, metadata)
+        except Exception as e:
+            if "dataset_id" in locals():
+                store_family.discard_upload(dataset_id)
+            return jsonify(ok=False, errors=[str(e)], warnings=[], detected={}, optional={}, preview=[])
+        return jsonify(ok=True, adapter="store_family", dataset_id=dataset_id,
+                       size_bytes=size, dataset=metadata)
+    # Anything that is not already canonical is profiled so the UI can map its
+    # columns (date + entity + sales required; everything else optional).
+    if not generic.canonical_required_present(header):
+        try:
+            dataset_id, path, size = generic.save_upload(f.stream)
+            prof = generic.profile(path)
+            generic.save_metadata(dataset_id, prof)
+        except Exception as e:
+            if "dataset_id" in locals():
+                generic.discard(dataset_id)
+            return jsonify(ok=False, errors=[str(e)], warnings=[], detected={}, optional={}, preview=[])
+        return jsonify(ok=True, adapter="generic", dataset_id=dataset_id, size_bytes=size,
+                       profile=prof, preview=prof.get("preview", []))
     result = data_upload.process(f.read())
     normalized = result.pop("normalized", None)
     if not result.get("ok") or normalized is None:
@@ -194,6 +218,84 @@ def favorita_prepare(dataset_id):
     return jsonify(ok=True, dataset_id=dataset_id, detected=detected)
 
 
+@app.post("/api/store-family/upload")
+def store_family_upload():
+    """Accept a large store/family train.csv incrementally and return file metadata."""
+    f = request.files.get("file")
+    if f is None:
+        return jsonify(ok=False, error="Choose a CSV file to upload."), 400
+    try:
+        dataset_id, path, size = store_family.save_upload(f.stream)
+        metadata = store_family.inspect(path)
+        store_family.save_metadata(dataset_id, metadata)
+    except Exception as e:
+        if "dataset_id" in locals():
+            store_family.discard_upload(dataset_id)
+        return jsonify(ok=False, error=str(e)), 400
+    return jsonify(ok=True, dataset_id=dataset_id, size_bytes=size, dataset=metadata)
+
+
+@app.get("/api/store-family/datasets/<dataset_id>")
+def store_family_dataset(dataset_id):
+    """Read saved file metadata, optionally returning families for one store."""
+    if not store_family.exists(dataset_id):
+        return jsonify(ok=False, error="Unknown dataset. Upload the CSV again."), 404
+    metadata = store_family.load_metadata(dataset_id) or {}
+    store = request.args.get("store_nbr")
+    if store is not None:
+        try:
+            metadata["store_families"] = store_family.available_families(store_family.raw_path(dataset_id), store)
+        except Exception as e:
+            return jsonify(ok=False, error=str(e)), 400
+    return jsonify(ok=True, dataset=metadata)
+
+
+@app.post("/api/store-family/datasets/<dataset_id>/prepare")
+def store_family_prepare(dataset_id):
+    """Prepare a bounded, user-selected subset in the existing pipeline format."""
+    if not store_family.exists(dataset_id):
+        return jsonify(ok=False, error="Unknown dataset. Upload the CSV again."), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        normalized, detected = store_family.prepare(
+            store_family.raw_path(dataset_id), body.get("store_nbr"), body.get("families") or [],
+            body.get("start_date"), body.get("end_date"))
+        data_upload.save_dataset(dataset_id, normalized)
+        data_upload.save_meta(dataset_id, dict(detected=detected, optional={}, warnings=detected["warnings"],
+                                               adapter="store_family", store_nbr=detected["store_nbr"]))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 400
+    return jsonify(ok=True, dataset_id=dataset_id, detected=detected)
+
+
+@app.get("/api/generic/datasets/<dataset_id>")
+def generic_dataset(dataset_id):
+    """Return the saved column profile for a generically uploaded CSV."""
+    if not generic.exists(dataset_id):
+        return jsonify(ok=False, error="Unknown dataset. Upload the CSV again."), 404
+    profile = generic.load_metadata(dataset_id) or {}
+    return jsonify(ok=True, profile=profile)
+
+
+@app.post("/api/generic/datasets/<dataset_id>/prepare")
+def generic_prepare(dataset_id):
+    """Apply a user-confirmed column mapping and normalize the dataset."""
+    if not generic.exists(dataset_id):
+        return jsonify(ok=False, error="Unknown dataset. Upload the CSV again."), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        normalized, detected = generic.prepare(
+            generic.raw_path(dataset_id), body.get("mapping") or {},
+            store=body.get("store"), products=body.get("products") or None,
+            start_date=body.get("start_date"), end_date=body.get("end_date"))
+        data_upload.save_dataset(dataset_id, normalized)
+        data_upload.save_meta(dataset_id, dict(detected=detected, optional=detected.get("optional", {}),
+                                               warnings=detected["warnings"], adapter="generic"))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 400
+    return jsonify(ok=True, dataset_id=dataset_id, detected=detected)
+
+
 @app.post("/api/train")
 def train_endpoint():
     """Start a training run for either the synthetic demo or an uploaded dataset."""
@@ -219,6 +321,10 @@ def train_endpoint():
                 return jsonify(ok=False, error="Enter a positive unit cost for each selected Favorita item before forecasting: "
                                                + ", ".join(missing_cost)), 400
             dataset_source = "favorita"
+        elif meta.get("adapter") == "store_family":
+            dataset_source = "store_family"
+        elif meta.get("adapter") == "generic":
+            dataset_source = "generic"
         else:
             dataset_source = "uploaded"
         products = data_upload.build_products(meta.get("detected", {}), body.get("inventory") or {})

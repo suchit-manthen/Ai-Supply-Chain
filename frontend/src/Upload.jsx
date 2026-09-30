@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { fmt } from './ui.jsx'
 import FavoritaUpload from './FavoritaUpload.jsx'
+import GenericUpload from './GenericUpload.jsx'
 
 const Card = ({ t, s, children }) => <section className="card"><h3>{t}</h3>{s && <p className="sub">{s}</p>}{children}</section>
 const OPTIONAL_LABELS = { category: 'category', price: 'price', discount: 'discount', temp: 'temperature', holiday_lift: 'holiday lift' }
@@ -12,6 +13,7 @@ export default function Upload({ onStarted, onCancel }) {
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState(null)
   const [favoritaUpload, setFavoritaUpload] = useState(null)
+  const [genericUpload, setGenericUpload] = useState(null)
 
   async function onFile(e) {
     const f = e.target.files?.[0]
@@ -20,9 +22,15 @@ export default function Upload({ onStarted, onCancel }) {
     try {
       const fd = new FormData(); fd.append('file', f)
       const r = await (await fetch('/api/upload', { method: 'POST', body: fd })).json()
-      if (r.adapter === 'favorita') {
+      if (r.adapter === 'favorita' || r.adapter === 'store_family') {
         setFavoritaUpload(r)
-        setFormat('favorita')
+        setFormat(r.adapter)
+        setBusy(false)
+        return
+      }
+      if (r.adapter === 'generic') {
+        setGenericUpload(r)
+        setFormat('generic')
         setBusy(false)
         return
       }
@@ -57,19 +65,22 @@ export default function Upload({ onStarted, onCancel }) {
   const detected = report?.detected
   const missingOptional = report ? Object.entries(report.optional).filter(([, v]) => !v).map(([k]) => OPTIONAL_LABELS[k]) : []
 
-  if (format === 'favorita') return <FavoritaUpload initialUpload={favoritaUpload} onStarted={onStarted} onCancel={onCancel} onBack={() => { setFavoritaUpload(null); setFormat('stocksense') }} />
+  if (format === 'favorita' || format === 'store_family') return <FavoritaUpload mode={format} initialUpload={favoritaUpload} onStarted={onStarted} onCancel={onCancel} onBack={() => { setFavoritaUpload(null); setFormat('stocksense') }} />
+  if (format === 'generic') return <GenericUpload initialUpload={genericUpload} onStarted={onStarted} onCancel={onCancel} onBack={() => { setGenericUpload(null); setFormat('stocksense') }} />
 
   return (
     <>
       <div className="srcbtns" style={{ marginBottom: 16 }}>
         <button className="srcbtn on" type="button">StockSense CSV</button>
+        <button className="srcbtn" type="button" onClick={() => setFormat('generic')}>Any CSV (auto-detect)</button>
         <button className="srcbtn" type="button" onClick={() => setFormat('favorita')}>Favorita train.csv</button>
+        <button className="srcbtn" type="button" onClick={() => setFormat('store_family')}>Store + family train.csv</button>
       </div>
       <div className="head">
         <div><h1>Upload your supermarket data</h1><p>Upload a CSV of historical sales — the system validates it, selects a model per SKU and builds the dashboard.</p></div>
       </div>
 
-      <Card t="1. Choose a CSV file" s="Required columns: date, product, sales. Optional: category, price, discount, temp, holiday_lift. Headers are matched case-insensitively; use the exact sample format below for easiest import.">
+      <Card t="1. Choose a CSV file" s="Canonical columns: date, product, sales (optional: category, price, discount, temp, holiday_lift). Any other schema — Favorita, store+family, or an arbitrary sales export — is detected automatically and you can map its columns next.">
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
           <input type="file" accept=".csv,text/csv" onChange={onFile} disabled={busy} />
           <a className="srcbtn" href="/api/sample-csv" download>Download sample CSV</a>

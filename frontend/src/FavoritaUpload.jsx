@@ -3,7 +3,33 @@ import { fmt } from './ui.jsx'
 
 const Card = ({ t, s, children }) => <section className="card"><h3>{t}</h3>{s && <p className="sub">{s}</p>}{children}</section>
 
-export default function FavoritaUpload({ onStarted, onCancel, onBack, initialUpload = null }) {
+const MODES = {
+  favorita: {
+    title: 'Favorita dataset',
+    blurb: 'Upload the large Kaggle train.csv, then prepare a small store and item subset for the existing forecasting workflow.',
+    uploadHint: 'Required columns: date, store_nbr, item_nbr, unit_sales. Optional: onpromotion. The file is scanned in chunks; it is not loaded as one large table.',
+    base: '/api/favorita',
+    entitySingular: 'Item',
+    entityPlural: 'items',
+    listKey: 'store_items',
+    requestKey: 'item_nbrs',
+    inventoryNote: 'Favorita train.csv does not include on-hand stock, lead time or cost. Suggested stock is only a planning default based on recent observed sales; review these values before training.',
+  },
+  store_family: {
+    title: 'Store + family dataset',
+    blurb: 'Upload the store/family train.csv, then prepare a small store and product-family subset for the existing forecasting workflow.',
+    uploadHint: 'Required columns: date, store_nbr, family, sales. Optional: onpromotion. The file is scanned in chunks; it is not loaded as one large table.',
+    base: '/api/store-family',
+    entitySingular: 'Family',
+    entityPlural: 'families',
+    listKey: 'store_families',
+    requestKey: 'families',
+    inventoryNote: 'This source has no on-hand stock, lead time or cost. Suggested stock is only a planning default based on recent observed sales; review these values before training.',
+  },
+}
+
+export default function FavoritaUpload({ onStarted, onCancel, onBack, initialUpload = null, mode = 'favorita' }) {
+  const cfg = MODES[mode] || MODES.favorita
   const [fileInfo, setFileInfo] = useState(initialUpload)
   const [store, setStore] = useState('')
   const [items, setItems] = useState([])
@@ -21,7 +47,7 @@ export default function FavoritaUpload({ onStarted, onCancel, onBack, initialUpl
     setBusy(true); setMsg(null); setFileInfo(null); setPrepared(null)
     try {
       const fd = new FormData(); fd.append('file', file)
-      const response = await fetch('/api/favorita/upload', { method: 'POST', body: fd })
+      const response = await fetch(`${cfg.base}/upload`, { method: 'POST', body: fd })
       const result = await response.json()
       if (!result.ok) throw new Error(result.error || 'Could not accept this CSV.')
       setFileInfo(result)
@@ -36,9 +62,9 @@ export default function FavoritaUpload({ onStarted, onCancel, onBack, initialUpl
     if (!value || !fileInfo) return
     setBusy(true)
     try {
-      const result = await (await fetch(`/api/favorita/datasets/${fileInfo.dataset_id}?store_nbr=${encodeURIComponent(value)}`)).json()
-      if (!result.ok) throw new Error(result.error || 'Could not load store items.')
-      setItems(result.dataset.store_items || [])
+      const result = await (await fetch(`${cfg.base}/datasets/${fileInfo.dataset_id}?store_nbr=${encodeURIComponent(value)}`)).json()
+      if (!result.ok) throw new Error(result.error || `Could not load store ${cfg.entityPlural}.`)
+      setItems(result.dataset[cfg.listKey] || [])
     } catch (error) { setMsg(error.message) }
     setBusy(false)
   }
@@ -50,9 +76,9 @@ export default function FavoritaUpload({ onStarted, onCancel, onBack, initialUpl
   async function prepare() {
     setBusy(true); setMsg(null)
     try {
-      const response = await fetch(`/api/favorita/datasets/${fileInfo.dataset_id}/prepare`, {
+      const response = await fetch(`${cfg.base}/datasets/${fileInfo.dataset_id}/prepare`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ store_nbr: store, item_nbrs: chosen, start_date: dates.start, end_date: dates.end }),
+        body: JSON.stringify({ store_nbr: store, [cfg.requestKey]: chosen, start_date: dates.start, end_date: dates.end }),
       })
       const result = await response.json()
       if (!result.ok) throw new Error(result.error || 'Could not prepare this selection.')
@@ -82,10 +108,10 @@ export default function FavoritaUpload({ onStarted, onCancel, onBack, initialUpl
   const setRow = (id, key, value) => setInv(v => ({ ...v, [id]: { ...v[id], [key]: value } }))
 
   return <>
-    <div className="head"><div><h1>Favorita dataset</h1><p>Upload the large Kaggle train.csv, then prepare a small store and item subset for the existing forecasting workflow.</p></div></div>
+    <div className="head"><div><h1>{cfg.title}</h1><p>{cfg.blurb}</p></div></div>
     <div className="srcbtns" style={{ marginBottom: 16 }}><button className="srcbtn" onClick={onBack}>Use StockSense CSV</button><button className="srcbtn" onClick={onCancel}>Cancel</button></div>
 
-    <Card t="1. Upload Favorita train.csv" s="Required columns: date, store_nbr, item_nbr, unit_sales. Optional: onpromotion. The file is scanned in chunks; it is not loaded as one large table.">
+    <Card t={`1. Upload ${cfg.title.toLowerCase()}`} s={cfg.uploadHint}>
       <input type="file" accept=".csv,text/csv" onChange={upload} disabled={busy} />
       {busy && <p className="sub" style={{ marginTop: 8 }}>Processing selected data…</p>}
       {msg && <p className="sub" style={{ color: '#a92917', marginTop: 8 }}>{msg}</p>}
@@ -93,35 +119,35 @@ export default function FavoritaUpload({ onStarted, onCancel, onBack, initialUpl
     </Card>
 
     {metadata && <Card t="2. Dataset overview" s="Statistics are computed while reading the file in chunks.">
-      <div className="stat"><div><b>{fmt(metadata.rows)}</b><span>rows</span></div><div><b>{metadata.date_min || '—'} → {metadata.date_max || '—'}</b><span>date range</span></div><div><b>{fmt(metadata.stores)}</b><span>stores</span></div><div><b>{fmt(metadata.skus)}</b><span>distinct items / SKUs</span></div></div>
+      <div className="stat"><div><b>{fmt(metadata.rows)}</b><span>rows</span></div><div><b>{metadata.date_min || '—'} → {metadata.date_max || '—'}</b><span>date range</span></div><div><b>{fmt(metadata.stores)}</b><span>stores</span></div><div><b>{fmt(metadata.skus)}</b><span>distinct {cfg.entityPlural} / SKUs</span></div></div>
       <p className="sub"><b>Available columns:</b> {metadata.available_columns.join(', ')}</p>
       {metadata.warnings.length > 0 && <ul className="issues warn">{metadata.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul>}
-      <p className="sub">Quality counts: invalid dates {metadata.quality.invalid_dates}; invalid sales {metadata.quality.invalid_sales}; missing sales {metadata.quality.missing_sales}; negative unit-sales rows {metadata.quality.negative_unit_sales_rows}; missing store/item ids {metadata.quality.missing_store_or_item}; missing promotion flags {metadata.quality.missing_promotion}.</p>
+      <p className="sub">Quality counts: invalid dates {metadata.quality.invalid_dates}; invalid sales {metadata.quality.invalid_sales}; missing sales {metadata.quality.missing_sales}; negative sales rows {metadata.quality.negative_sales_rows}; missing store/entity ids {metadata.quality.missing_store_or_family ?? metadata.quality.missing_store_or_item}; missing promotion flags {metadata.quality.missing_promotion}.</p>
     </Card>}
 
-    {metadata && <Card t="3. Select a manageable subset" s="Choose one store, up to eight items, and a date range. Preparation aggregates duplicate date/store/item rows by summing unit_sales and combines promotion flags with logical OR.">
+    {metadata && <Card t="3. Select a manageable subset" s={`Choose one store, up to eight ${cfg.entityPlural}, and a date range. Preparation aggregates duplicate date/store/${cfg.entityPlural} rows by summing sales and combines promotion flags with logical OR.`}>
       <div className="scenario-inputs">
         <label>Store<select className="numin" value={store} onChange={e => selectStore(e.target.value)}><option value="">Choose store</option>{metadata.store_options.map(s => <option key={s} value={s}>{s}</option>)}</select></label>
         <label>Start date<input className="numin" type="date" min={metadata.date_min || undefined} max={metadata.date_max || undefined} value={dates.start} onChange={e => setDates(d => ({ ...d, start: e.target.value }))} /></label>
         <label>End date<input className="numin" type="date" min={metadata.date_min || undefined} max={metadata.date_max || undefined} value={dates.end} onChange={e => setDates(d => ({ ...d, end: e.target.value }))} /></label>
       </div>
       {store && <>
-        <p className="sub" style={{ marginTop: 12 }}>{items.length} items found for store {store}. Selected {chosen.length}/8.</p>
-        <input className="numin" style={{ width: 240, textAlign: 'left' }} value={query} placeholder="Filter item ids" onChange={e => setQuery(e.target.value)} />
-        <div className="item-picker">{visibleItems.map(item => <label key={item}><input type="checkbox" checked={chosen.includes(item)} onChange={() => toggleItem(item)} /> {item}</label>)}{items.length > visibleItems.length && <small>Showing first 120 matches; refine the filter to find other item ids.</small>}</div>
-        <button className="act" onClick={prepare} disabled={busy || chosen.length === 0}>Prepare selected items</button>
+        <p className="sub" style={{ marginTop: 12 }}>{items.length} {cfg.entityPlural} found for store {store}. Selected {chosen.length}/8.</p>
+        <input className="numin" style={{ width: 240, textAlign: 'left' }} value={query} placeholder={`Filter ${cfg.entityPlural}`} onChange={e => setQuery(e.target.value)} />
+        <div className="item-picker">{visibleItems.map(item => <label key={item}><input type="checkbox" checked={chosen.includes(item)} onChange={() => toggleItem(item)} /> {item}</label>)}{items.length > visibleItems.length && <small>Showing first 120 matches; refine the filter to find other {cfg.entityPlural}.</small>}</div>
+        <button className="act" onClick={prepare} disabled={busy || chosen.length === 0}>Prepare selected {cfg.entityPlural}</button>
       </>}
     </Card>}
 
     {prepared && <>
-      <Card t="4. Prepared dataset" s="This is the normalized, selected subset passed to the existing pipeline. Missing daily observations are not filled with zero; items with gaps are rejected so demand is not fabricated.">
+      <Card t="4. Prepared dataset" s="This is the normalized, selected subset passed to the existing pipeline. Missing daily observations are not filled with zero; series with gaps are rejected so demand is not fabricated.">
         <div className="stat"><div><b>{fmt(prepared.detected.rows)}</b><span>aggregated daily rows</span></div><div><b>{prepared.detected.store_nbr}</b><span>store</span></div><div><b>{prepared.detected.skus}</b><span>selected SKUs</span></div><div><b>{prepared.detected.date_min} → {prepared.detected.date_max}</b><span>prepared date range</span></div><div><b>{prepared.detected.duplicate_rows_aggregated}</b><span>duplicate rows combined</span></div></div>
         <p className="sub"><b>Adapter quality:</b> {JSON.stringify(prepared.detected.quality)}</p>
         <p className="sub"><b>Prepared columns:</b> {prepared.detected.columns.join(', ')}</p>
         {prepared.detected.warnings.map((warning, i) => <p className="sub" key={i}>{warning}</p>)}
       </Card>
-      <Card t="5. Inventory configuration" s="Favorita train.csv does not include on-hand stock, lead time or cost. Suggested stock is only a planning default based on recent observed sales; review these values before training.">
-        <div className="scroll"><table className="tbl"><thead><tr><th>Item</th><th className="num">Current stock</th><th className="num">On order</th><th className="num">Lead time (days)</th><th className="num">Unit cost</th><th className="num">Service level</th></tr></thead>
+      <Card t="5. Inventory configuration" s={cfg.inventoryNote}>
+        <div className="scroll"><table className="tbl"><thead><tr><th>{cfg.entitySingular}</th><th className="num">Current stock</th><th className="num">On order</th><th className="num">Lead time (days)</th><th className="num">Unit cost</th><th className="num">Service level</th></tr></thead>
           <tbody>{prepared.detected.products.map(p => <tr key={p.id}><td><b>{p.id}</b></td>
             <td className="num"><input className="numin" type="number" min="0" value={inv[p.id]?.stock ?? 0} onChange={e => setRow(p.id, 'stock', e.target.value)} /></td>
             <td className="num"><input className="numin" type="number" min="0" value={inv[p.id]?.on_order ?? 0} onChange={e => setRow(p.id, 'on_order', e.target.value)} /></td>
