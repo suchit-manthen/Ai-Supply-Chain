@@ -24,7 +24,11 @@ const confColor = c => (c >= 0.75 ? '#1d6238' : c >= 0.5 ? '#8a6100' : '#a92917'
 export default function GenericUpload({ onStarted, onCancel, onBack, initialUpload = null }) {
   const [info, setInfo] = useState(initialUpload)
   const profile = info?.profile
+  const layout = profile?.layout || 'long'
+  const isWide = layout === 'wide'
   const [mapping, setMapping] = useState({ ...(initialUpload?.profile?.mapping || {}) })
+  const [valueColumns, setValueColumns] = useState(
+    initialUpload?.profile?.mapping?.value_columns || initialUpload?.profile?.wide_columns || [])
   const [filters, setFilters] = useState({
     store: '',
     start: initialUpload?.profile?.date_min || '',
@@ -46,6 +50,7 @@ export default function GenericUpload({ onStarted, onCancel, onBack, initialUplo
         ? `This looks like a ${r.adapter} file — use that tab instead.`
         : (r.errors?.[0] || 'Could not profile this CSV.'))
       setInfo(r); setMapping({ ...(r.profile?.mapping || {}) })
+      setValueColumns(r.profile?.mapping?.value_columns || r.profile?.wide_columns || [])
       setFilters({ store: '', start: r.profile?.date_min || '', end: r.profile?.date_max || '' })
     } catch (error) { setMsg(error.message) }
     setBusy(false)
@@ -55,7 +60,7 @@ export default function GenericUpload({ onStarted, onCancel, onBack, initialUplo
     return <>
       <div className="head"><div><h1>Generic CSV</h1><p>Upload any sales CSV. Its columns are profiled and mapped to the model schema automatically; only date, product/entity and sales are required.</p></div></div>
       <div className="srcbtns" style={{ marginBottom: 16 }}><button className="srcbtn" onClick={onBack}>Use another format</button><button className="srcbtn" onClick={onCancel}>Cancel</button></div>
-      <Card t="Choose a CSV file" s="Headers are matched case-insensitively. Favorita and store+family files are detected automatically and offered their own flow.">
+      <Card t="Choose a CSV file" s="Headers are matched case-insensitively. Long and wide layouts are both supported. Favorita and store+family files are detected automatically and offered their own flow.">
         <input type="file" accept=".csv,text/csv" onChange={upload} disabled={busy} />
         {busy && <p className="sub" style={{ marginTop: 8 }}>Profiling…</p>}
         {msg && <p className="sub" style={{ color: '#a92917', marginTop: 8 }}>{msg}</p>}
@@ -64,17 +69,24 @@ export default function GenericUpload({ onStarted, onCancel, onBack, initialUplo
   }
 
   const columns = profile.columns.map(c => c.name)
+  const missingRequired = isWide
+    ? [...(!mapping.date ? ['Date'] : []), ...(valueColumns.length ? [] : ['Value columns'])]
+    : REQUIRED.filter(r => !mapping[r.role]).map(r => r.label)
   const setRole = (role, value) => setMapping(m => ({ ...m, [role]: value || undefined }))
-  const missingRequired = REQUIRED.filter(r => !mapping[r.role])
+  const toggleValue = col => setValueColumns(cols => cols.includes(col) ? cols.filter(c => c !== col) : [...cols, col])
 
   async function prepare() {
     setBusy(true); setMsg(null)
     try {
+      const sendMapping = isWide
+        ? { layout: 'wide', date: mapping.date, store: mapping.store, value_columns: valueColumns, id_columns: profile.mapping?.id_columns || [] }
+        : mapping
       const body = {
-        mapping,
+        mapping: sendMapping,
         store: filters.store || undefined,
         start_date: filters.start || undefined,
         end_date: filters.end || undefined,
+        wide_missing: filters.wideMissing || 'zero',
       }
       const result = await (await fetch(`/api/generic/datasets/${info.dataset_id}/prepare`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -122,33 +134,53 @@ export default function GenericUpload({ onStarted, onCancel, onBack, initialUplo
     )
   }
 
+  const idChoices = columns.filter(c => c !== mapping.date && !valueColumns.includes(c))
+
   return <>
     <div className="head"><div><h1>Generic CSV</h1><p>Columns were detected automatically. Confirm or fix the mapping; only date, product/entity and sales are required — every other field is optional.</p></div></div>
     <div className="srcbtns" style={{ marginBottom: 16 }}><button className="srcbtn" onClick={onBack}>Use another format</button><button className="srcbtn" onClick={onCancel}>Cancel</button></div>
+    <div className="stat" style={{ marginBottom: 12 }}>
+      <div><b>{fmt(profile.rows_sampled)}</b><span>rows profiled</span></div>
+      <div><b>{layout === 'wide' ? 'Wide (matrix)' : 'Long (one row per obs.)'}</b><span>detected layout</span></div>
+      <div><b>{profile.date_format || '—'}</b><span>date format</span></div>
+    </div>
 
-    <Card t="1. Column mapping" s="Confidence is how strongly a column matched a role from its name and values. Adjust any dropdown, then prepare.">
-      {missingRequired.length > 0 && <ul className="issues warn">{missingRequired.map(r => <li key={r.role}>Required role not set: {r.label}</li>)}</ul>}
-      <div className="scroll"><table className="tbl">
-        <thead><tr><th>Role</th><th>Column</th><th className="num">Confidence</th><th>Why</th></tr></thead>
-        <tbody>{REQUIRED.map(roleRow)}{OPTIONAL.map(roleRow)}</tbody>
-      </table></div>
-      {profile.warnings?.length > 0 && <ul className="issues warn">{profile.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>}
-    </Card>
+    {isWide
+      ? <Card t="1. Wide layout" s="Each value column is treated as a separate product/series and melted into long rows. Choose the date column, optional id column and the value columns to keep.">
+          {missingRequired.length > 0 && <ul className="issues warn">{missingRequired.map(x => <li key={x}>Required: {x}</li>)}</ul>}
+          <div className="scenario-inputs">
+            <label>Date column<select className="numin" value={mapping.date || ''} onChange={e => setRole('date', e.target.value)}><option value="">— choose a column —</option>{columns.map(c => <option key={c} value={c}>{c}</option>)}</select></label>
+            <label>Id column (optional)<select className="numin" value={mapping.store || ''} onChange={e => setRole('store', e.target.value)}><option value="">— none —</option>{idChoices.map(c => <option key={c} value={c}>{c}</option>)}</select></label>
+          </div>
+          <p className="sub" style={{ marginTop: 12 }}>Value columns ({valueColumns.length} selected):</p>
+          <div className="item-picker">
+            {profile.wide_columns.map(c => <label key={c}><input type="checkbox" checked={valueColumns.includes(c)} onChange={() => toggleValue(c)} /> {c}</label>)}
+          </div>
+        </Card>
+      : <Card t="1. Column mapping" s="Confidence is how strongly a column matched a role from its name and values. Adjust any dropdown, then prepare.">
+          {missingRequired.length > 0 && <ul className="issues warn">{missingRequired.map(x => <li key={x}>Required role not set: {x}</li>)}</ul>}
+          <div className="scroll"><table className="tbl">
+            <thead><tr><th>Role</th><th>Column</th><th className="num">Confidence</th><th>Why</th></tr></thead>
+            <tbody>{REQUIRED.map(roleRow)}{OPTIONAL.map(roleRow)}</tbody>
+          </table></div>
+        </Card>}
+    {profile.warnings?.length > 0 && <ul className="issues warn" style={{ margin: '0 0 14px 0' }}>{profile.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>}
 
-    <Card t="2. Optional filters" s="Optionally restrict the rows sent to the model. If a store column is mapped and not filtered, series are keyed as store|entity.">
+    <Card t="2. Optional filters" s="Optionally restrict rows. If an id/store column is mapped and not filtered, series are keyed as store|entity.">
       <div className="scenario-inputs">
         {profile.stores?.length > 0 && <label>Store<select className="numin" value={filters.store} onChange={e => setFilters(f => ({ ...f, store: e.target.value }))}><option value="">All stores</option>{profile.stores.map(s => <option key={s} value={s}>{s}</option>)}</select></label>}
         <label>Start date<input className="numin" type="date" min={profile.date_min || undefined} max={profile.date_max || undefined} value={filters.start} onChange={e => setFilters(f => ({ ...f, start: e.target.value }))} /></label>
         <label>End date<input className="numin" type="date" min={profile.date_min || undefined} max={profile.date_max || undefined} value={filters.end} onChange={e => setFilters(f => ({ ...f, end: e.target.value }))} /></label>
+        {isWide && <label>Missing cells<select className="numin" value={filters.wideMissing || 'zero'} onChange={e => setFilters(f => ({ ...f, wideMissing: e.target.value }))}><option value="zero">Treat as zero</option><option value="dropped">Drop the row</option></select></label>}
       </div>
       {msg && <p className="sub" style={{ color: '#a92917', marginTop: 10 }}>{msg}</p>}
       <div style={{ marginTop: 14 }}><button className="act" onClick={prepare} disabled={busy || missingRequired.length > 0}>Prepare dataset</button></div>
     </Card>
 
     {prepared && <>
-      <Card t="3. Prepared dataset" s="Normalized to date, product, sales, discount, price, temp, holiday_lift and stockout. Missing optional fields use neutral defaults.">
+      <Card t="3. Prepared dataset" s="Normalized to date, product, sales, discount, price, temp, holiday_lift and stockout. Duplicates are aggregated per product+date; missing optional fields use neutral defaults.">
         <div className="stat"><div><b>{fmt(prepared.detected.rows)}</b><span>daily rows</span></div><div><b>{prepared.detected.skus}</b><span>SKUs</span></div><div><b>{prepared.detected.date_min} → {prepared.detected.date_max}</b><span>date range</span></div></div>
-        <p className="sub"><b>Fields mapped:</b> {Object.entries(prepared.detected.optional || {}).map(([k, v]) => `${k}:${v ? 'yes' : 'no'}`).join(', ')}</p>
+        {prepared.detected.report && <p className="sub"><b>Normalization:</b> layout {prepared.detected.layout}; date format {prepared.detected.report.date_format || '—'}; duplicates aggregated {prepared.detected.report.duplicates_aggregated ?? 0}; rows dropped for missing required {prepared.detected.report.dropped_missing_required ?? 0}{prepared.detected.report.wide_cells_filled_zero ? `; wide cells filled with 0: ${prepared.detected.report.wide_cells_filled_zero}` : ''}.</p>}
         {prepared.detected.warnings?.length > 0 && <ul className="issues warn">{prepared.detected.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>}
         <div className="scroll" style={{ marginTop: 10 }}><table className="tbl">
           <thead><tr><th>SKU</th><th>Category</th><th className="num">Rows</th><th className="num">Suggested stock</th></tr></thead>

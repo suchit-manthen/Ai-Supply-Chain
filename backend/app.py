@@ -287,7 +287,8 @@ def generic_prepare(dataset_id):
         normalized, detected = generic.prepare(
             generic.raw_path(dataset_id), body.get("mapping") or {},
             store=body.get("store"), products=body.get("products") or None,
-            start_date=body.get("start_date"), end_date=body.get("end_date"))
+            start_date=body.get("start_date"), end_date=body.get("end_date"),
+            wide_missing=body.get("wide_missing") or "zero")
         data_upload.save_dataset(dataset_id, normalized)
         data_upload.save_meta(dataset_id, dict(detected=detected, optional=detected.get("optional", {}),
                                                warnings=detected["warnings"], adapter="generic"))

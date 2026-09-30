@@ -1,14 +1,18 @@
-"""Generic CSV understanding: infer a schema for an arbitrary sales export.
+"""Generic CSV understanding: infer a schema then normalize to canonical.
 
-Given any delimited sales file, this module profiles each column, scores how
-well it fits each semantic role (date, sales/demand, product/entity, store and
-known optional drivers), and returns a ranked mapping with confidence scores.
-Minimum requirement is ``date + product/entity + sales``; every other role is
-optional and left out of the mapping when it cannot be found.
+Given any delimited sales file, this module:
 
-``profile`` never mutates the source; ``normalize`` turns a frame plus a mapping
-into the canonical ``date, product, sales, discount, price, temp, holiday_lift,
-stockout`` shape used by the rest of the pipeline.
+1. profiles each column and scores how well it fits each semantic role
+   (date, sales/demand, product/entity, store and known optional drivers),
+   returning a ranked mapping with confidence scores;
+2. detects the table *layout* - long (one observation per row) or wide (one
+   column per product/series) - so a matrix export can be melted too;
+3. converts a user-confirmed mapping into the canonical
+   ``date, product, sales, discount, price, temp, holiday_lift, stockout``
+   shape, handling dates, duplicates/aggregation and missing values.
+
+Minimum requirement is ``date + product/entity + sales`` (for a wide file,
+``date + value columns``); every other role is optional.
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from config import MAX_UPLOAD_ROWS, HORIZON
+from config import MAX_UPLOAD_ROWS
 import data_upload
 from data_adapters import storage
 
@@ -55,7 +59,8 @@ NAME_SYNONYMS = {
     "price": ["price", "unitprice", "sellprice", "sellingprice", "retail", "retailprice", "mrp",
               "listprice", "saleprice", "cost", "unitcost"],
     "discount": ["discount", "disc", "discountpct", "discountpercent", "discountrate", "markdown",
-                 "rebate", "promodiscount", "discountamount"],
+                 "rebate", "promodiscount", "discountamount", "promo", "promotion", "promorate",
+                 "promopct", "promopercent", "promodepth"],
     "promo": ["onpromotion", "onpromo", "promo", "promotion", "promoted", "ispromo", "ispromotion",
               "promoflag", "promotionflag", "ad", "adflag", "feature", "featured"],
     "temp": ["temp", "temperature", "tempc", "tempf", "weathertemp", "maxtemp", "mintemp", "airtemp"],
@@ -105,6 +110,56 @@ def discard(dataset_id):
     storage.discard(dataset_id, SUFFIX)
 
 
+# --- date parsing -----------------------------------------------------------
+
+def _day_month_hint(text):
+    """Count ambiguous d/m vs m/d evidence so we can pick the right order."""
+    day_first = month_first = 0
+    for value in list(text.dropna().astype(str))[:300]:
+        match = re.match(r"^\s*(\d{1,2})[/\-.](\d{1,2})[/\-.]", value)
+        if match:
+            first, second = int(match.group(1)), int(match.group(2))
+            if first > 12:
+                day_first += 1
+            if second > 12:
+                month_first += 1
+    return day_first, month_first
+
+
+def _parse_dates(series):
+    """Parse a date column in several formats. Returns (series, format_note)."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series, "datetime"
+    if pd.api.types.is_numeric_dtype(series):
+        num = pd.to_numeric(series, errors="coerce")
+        valid = num.dropna()
+        if len(valid) and bool((valid % 1 == 0).all()) and valid.between(19000101, 29991231).mean() > 0.9:
+            return pd.to_datetime(num.astype("Int64").astype("string"), format="%Y%m%d", errors="coerce"), "%Y%m%d"
+        return None, None
+
+    text = series.astype("string").str.strip()
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"]:
+        parsed = pd.to_datetime(text, format=fmt, errors="coerce")
+        if parsed.notna().mean() > 0.9:
+            return parsed, fmt
+
+    day_first, month_first = _day_month_hint(text)
+    if day_first >= month_first:
+        ordered = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%m/%d/%Y", "%m-%d-%Y"]
+    else:
+        ordered = ["%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"]
+    ordered += ["%b %d, %Y", "%d %b %Y", "%B %d, %Y", "%d %B %Y"]
+    for fmt in ordered:
+        parsed = pd.to_datetime(text, format=fmt, errors="coerce")
+        if parsed.notna().mean() > 0.9:
+            return parsed, fmt
+    try:
+        parsed = pd.to_datetime(text, errors="coerce")
+    except Exception:
+        return None, None
+    return (parsed, "inferred") if parsed is not None else (None, None)
+
+
 # --- profiling --------------------------------------------------------------
 
 def _norm(name):
@@ -130,15 +185,6 @@ def _name_weight(column, role):
     return 0.0
 
 
-def _try_datetime(series):
-    if pd.api.types.is_numeric_dtype(series):
-        return None
-    try:
-        return pd.to_datetime(series, errors="coerce")
-    except Exception:
-        return None
-
-
 def _boolean_like(series):
     values = series.dropna().unique()
     if len(values) == 0 or len(values) > 3:
@@ -147,25 +193,24 @@ def _boolean_like(series):
 
 
 def _features(series):
-    name = series.name
     n = int(len(series))
     if n == 0:
         return dict(rows=0, missing_frac=1.0, nunique=0, uniq_ratio=0.0, is_numeric=False,
                     numeric_frac=0.0, nonneg=0.0, integer_like=False, looks_date=False,
-                    date_frac=0.0, plausible_date=False, boolean_like=False)
+                    date_frac=0.0, plausible_date=False, boolean_like=False, date_format=None)
     num = pd.to_numeric(series, errors="coerce")
     numeric_frac = float(num.notna().mean())
     is_numeric = numeric_frac >= 0.9
     nonneg = float((num.dropna() >= 0).mean()) if num.notna().any() else 0.0
     integer_like = bool(is_numeric and ((num.dropna() % 1 == 0).mean() >= 0.99))
-    dt = _try_datetime(series)
+    dt, date_format = _parse_dates(series)
     if dt is not None:
         parsed = dt.notna()
         date_frac = float(parsed.mean())
         years = dt.dt.year.dropna()
         plausible_date = bool(len(years) and years.between(1990, 2100).all())
     else:
-        date_frac, plausible_date = 0.0, False
+        date_frac, plausible_date, date_format = 0.0, False, None
     nunique = int(series.nunique(dropna=True))
     return dict(
         rows=n, missing_frac=float(series.isna().mean()), nunique=nunique,
@@ -173,6 +218,7 @@ def _features(series):
         nonneg=nonneg, integer_like=integer_like,
         looks_date=bool(date_frac >= 0.9 and plausible_date and nunique > 1),
         date_frac=date_frac, plausible_date=plausible_date, boolean_like=_boolean_like(series),
+        date_format=date_format,
     )
 
 
@@ -267,7 +313,8 @@ def _score_frame(df):
     return scored, features
 
 
-def _assign(scored):
+def _assign_core(scored):
+    """Greedy exclusive assignment of columns to roles (no entity fallback)."""
     used = set()
     mapping = {}
     for role in ASSIGN_ORDER:
@@ -278,8 +325,11 @@ def _assign(scored):
                 mapping[role] = column
                 used.add(column)
             break
-    # A grouping column can legitimately be the entity when no dedicated product
-    # column exists (e.g. a file aggregated only by "family" or only by store).
+    return mapping
+
+
+def _finalize_long(mapping):
+    """Let a grouping column act as the entity when no product column exists."""
     if "product" not in mapping:
         for fallback in ("category", "store"):
             if fallback in mapping:
@@ -287,11 +337,42 @@ def _assign(scored):
                 if fallback == "store":
                     mapping.pop("store", None)  # avoid keying as "store|store"
                 break
-    # The entity label doubles as the category when no separate category exists.
     if "category" not in mapping and "product" in mapping:
         if _name_weight(mapping["product"], "category") > 0:
             mapping["category"] = mapping["product"]
     return mapping
+
+
+def _detect_layout(df, mapping, features):
+    """Return (layout, value_columns, id_columns). Long unless a matrix is found.
+
+    A wide file has no dedicated sales column: its entities are the column
+    headers. A numeric "product" role therefore does not prove a long layout
+    (it is itself one of the sibling value columns); only a non-numeric entity
+    column or an explicit sales column confirms long.
+    """
+    id_columns = [mapping["store"]] if mapping.get("store") else []
+    if mapping.get("sales"):
+        return "long", [], id_columns
+    product_col = mapping.get("product")
+    if product_col and not features[product_col]["is_numeric"]:
+        return "long", [], id_columns
+    date_col = mapping.get("date")
+    if not date_col:
+        return "long", [], id_columns
+    reserved = {mapping.get(r) for r in ("date", "price", "discount", "promo", "temp",
+                                         "holiday_lift", "stockout", "store", "category")}
+    value_columns = []
+    for col in df.columns:
+        f = features[col]
+        if col == date_col or col in reserved or f["looks_date"]:
+            continue
+        if _is_id_like(f) or not f["is_numeric"]:
+            continue
+        value_columns.append(str(col))
+    if len(value_columns) >= 2:
+        return "wide", value_columns, id_columns
+    return "long", [], id_columns
 
 
 def _jsonable(value):
@@ -322,8 +403,20 @@ def profile(path, sample_rows=SAMPLE_ROWS):
     df = pd.read_csv(path, nrows=sample_rows)
     df.columns = [str(c).strip() for c in df.columns]
     scored, features = _score_frame(df)
-    mapping = _assign(scored)
-    missing = [role for role in REQUIRED_ROLES if role not in mapping]
+
+    core = _assign_core(scored)
+    layout, value_columns, id_columns = _detect_layout(df, core, features)
+    if layout == "wide":
+        mapping = {"layout": "wide", "date": core.get("date")}
+        if core.get("store"):
+            mapping["store"] = core["store"]
+        mapping["value_columns"] = value_columns
+        mapping["id_columns"] = id_columns
+        missing = [] if mapping.get("date") and value_columns else (
+            ["date"] if not mapping.get("date") else ["value_columns"])
+    else:
+        mapping = _finalize_long(core)
+        missing = [role for role in REQUIRED_ROLES if role not in mapping]
 
     columns = []
     for col in df.columns:
@@ -342,34 +435,43 @@ def profile(path, sample_rows=SAMPLE_ROWS):
     confidence = {role: (scored[role][0][1] if scored[role] else 0.0) for role in ROLES}
 
     warnings = []
-    if missing:
+    if layout == "wide":
+        warnings.append(f"Detected a WIDE layout: {len(value_columns)} value columns treated as "
+                        "separate products/series. Confirm the value columns before preparing.")
+    elif missing:
         warnings.append("Could not confidently detect required role(s): " + ", ".join(missing)
                         + ". Choose the correct column for each before preparing.")
-    if mapping.get("store") and mapping.get("product"):
+    if layout == "long" and mapping.get("store") and mapping.get("product"):
         warnings.append("Both a store and an entity column were detected; values are keyed as "
                         "'store|entity' unless you filter to a single store.")
-    if "sales" in mapping and "price" in mapping and mapping["sales"] == mapping["price"]:
+    if layout == "long" and mapping.get("sales") and mapping.get("price") and mapping["sales"] == mapping["price"]:
         warnings.append("The sales and price roles point at the same column; override one of them.")
-    if not any(mapping.get(r) for r in ("discount", "promo")):
+    if layout == "long" and not any(mapping.get(r) for r in ("discount", "promo")):
         warnings.append("No promotion/discount column detected; promotion features will be zero.")
     warnings.append("Only the first few thousand rows are profiled; the full file is used when you prepare the dataset.")
 
     stores = []
-    if mapping.get("store"):
-        stores = sorted([str(v) for v in df[mapping["store"]].dropna().unique()])[:100]
+    store_col = mapping.get("store") if layout == "wide" else mapping.get("store")
+    if store_col:
+        stores = sorted([str(v) for v in df[store_col].dropna().unique()])[:100]
 
     date_min = date_max = None
+    date_format = None
     if "date" in mapping:
-        parsed = pd.to_datetime(df[mapping["date"]], errors="coerce").dropna()
-        if len(parsed):
-            date_min, date_max = parsed.min().strftime("%Y-%m-%d"), parsed.max().strftime("%Y-%m-%d")
+        parsed, date_format = _parse_dates(df[mapping["date"]])
+        if parsed is not None:
+            clean = parsed.dropna()
+            if len(clean):
+                date_min, date_max = clean.min().strftime("%Y-%m-%d"), clean.max().strftime("%Y-%m-%d")
 
     return dict(
-        rows_sampled=int(len(df)), columns=columns, roles=roles, mapping=mapping,
+        rows_sampled=int(len(df)), layout=layout, columns=columns, roles=roles, mapping=mapping,
+        wide_columns=value_columns, id_columns=id_columns,
         confidence={k: round(v, 3) for k, v in confidence.items()},
         required=dict(roles=REQUIRED_ROLES, satisfied=not missing, missing=missing),
         optional=dict(roles=OPTIONAL_ROLES, present=[r for r in OPTIONAL_ROLES if r in mapping]),
-        stores=stores, date_min=date_min, date_max=date_max, preview=_preview(df), warnings=warnings,
+        stores=stores, date_min=date_min, date_max=date_max, date_format=date_format,
+        preview=_preview(df), warnings=warnings,
     )
 
 
@@ -393,16 +495,21 @@ def _promotion(values):
     return (text.isin(truthy) | numeric.eq(1)).astype(float)
 
 
-def normalize(df, mapping):
-    """Map an arbitrary frame to the canonical schema and aggregate duplicates."""
+def _normalize_long(df, mapping, report=None):
+    """Map a long frame to the canonical schema and aggregate duplicates."""
+    report = report if report is not None else {}
     df = df.rename(columns=lambda c: str(c).lower().strip())
     mapping = _clean_mapping(mapping, set(df.columns))
     for role in REQUIRED_ROLES:
         if role not in mapping:
             raise ValueError(f"Mapping must set '{role}' to a column present in the file.")
 
+    report["rows_in"] = int(len(df))
+    parsed, date_format = _parse_dates(df[mapping["date"]])
+    report.setdefault("date_format", date_format)
+
     out = pd.DataFrame(index=df.index)
-    out["date"] = pd.to_datetime(df[mapping["date"]], errors="coerce")
+    out["date"] = parsed if parsed is not None else pd.to_datetime(df[mapping["date"]], errors="coerce")
     entity = df[mapping["product"]].astype("string").str.strip()
     if mapping.get("store"):
         store = df[mapping["store"]].astype("string").str.strip()
@@ -435,7 +542,10 @@ def normalize(df, mapping):
         out["stockout"] = 0
 
     out["product"] = out["product"].replace("", pd.NA)
+    before = len(out)
     out = out.dropna(subset=["date", "product", "sales"])
+    report["dropped_missing_required"] = int(before - len(out))
+
     out["discount"] = out["discount"].fillna(0.0).clip(lower=0.0)
     out["temp"] = out["temp"].fillna(0.0)
     out["holiday_lift"] = out["holiday_lift"].fillna(0.0)
@@ -446,35 +556,104 @@ def normalize(df, mapping):
         temp=("temp", "mean"), holiday_lift=("holiday_lift", "max"),
         stockout=("stockout", "max"), category=("category", "first"))
     aggregated["stockout"] = aggregated["stockout"].astype(int)
+    report["duplicates_aggregated"] = int(len(out) - len(aggregated))
+    report["rows_out"] = int(len(aggregated))
     return aggregated.sort_values(["product", "date"]).reset_index(drop=True)
 
 
-def prepare(path, mapping, store=None, products=None, start_date=None, end_date=None):
-    """Filter + normalize a mapped CSV into the pipeline format."""
+def normalize(df, mapping, report=None):
+    """Map an arbitrary long frame to the canonical schema and aggregate duplicates."""
+    return _normalize_long(df, mapping, report)
+
+
+def _melt_wide(raw, mapping, store, products, start_date, end_date, wide_missing, report, labels=None):
+    date_col = str(mapping["date"]).lower().strip()
+    value_columns = [str(c).lower().strip() for c in mapping.get("value_columns", [])
+                     if str(c).lower().strip() in raw.columns]
+    if not value_columns:
+        raise ValueError("A wide layout needs at least one value column.")
+    if products:
+        wanted = {str(p) for p in products}
+        value_columns = [c for c in value_columns if c in wanted]
+        if not value_columns:
+            raise ValueError("None of the selected products match the file's value columns.")
+
+    parsed, date_format = _parse_dates(raw[date_col])
+    report["date_format"] = date_format
+    frame = raw.assign(__date=parsed if parsed is not None else pd.to_datetime(raw[date_col], errors="coerce"))
+
+    mask = pd.Series(True, index=frame.index)
+    if start_date:
+        mask &= frame["__date"].isna() | (frame["__date"] >= pd.Timestamp(start_date).normalize())
+    if end_date:
+        mask &= frame["__date"].isna() | (frame["__date"] <= pd.Timestamp(end_date).normalize())
+
+    id_col = str(mapping["store"]).lower().strip() if mapping.get("store") else None
+    if id_col and id_col not in raw.columns:
+        id_col = None
+    id_vars = ["__date"] + ([id_col] if id_col else [])
+    if store is not None and id_col:
+        mask &= frame[id_col].astype(str) == str(store)
+    frame = frame[mask]
+
+    long = frame.melt(id_vars=id_vars, value_vars=value_columns, var_name="product", value_name="sales")
+    long = long.rename(columns={"__date": "date", id_col: "store"}) if id_col else long.rename(columns={"__date": "date"})
+    if labels:
+        long["product"] = long["product"].map(lambda v: labels.get(v, v))  # restore original header case
+
+    if wide_missing == "dropped":
+        pass
+    else:
+        filled = int(long["sales"].isna().sum())
+        long["sales"] = long["sales"].fillna(0.0)
+        report["wide_cells_filled_zero"] = filled
+
+    long_mapping = {"date": "date", "product": "product", "sales": "sales"}
+    if id_col:
+        long_mapping["store"] = "store"
+    return _normalize_long(long, long_mapping, report)
+
+
+def prepare(path, mapping, store=None, products=None, start_date=None, end_date=None, wide_missing="zero"):
+    """Filter + normalize a mapped CSV (long or wide) into the pipeline format."""
     raw = pd.read_csv(path)
     if len(raw) > MAX_UPLOAD_ROWS:
         raise ValueError(f"The file has {len(raw)} rows, exceeding the limit of {MAX_UPLOAD_ROWS}.")
+    labels = {str(c).strip().lower(): str(c).strip() for c in raw.columns}
     raw = raw.rename(columns=lambda c: str(c).lower().strip())
-    mapping = _clean_mapping(mapping, set(raw.columns))
-    for role in REQUIRED_ROLES:
-        if role not in mapping:
-            raise ValueError(f"Mapping must set '{role}' to a column present in the file.")
+    mapping = dict(mapping or {})
+    mapping = {k: (str(v).lower().strip() if isinstance(v, str) else v) for k, v in mapping.items()}
+    report = {}
 
-    if start_date or end_date:
-        dates = pd.to_datetime(raw[mapping["date"]], errors="coerce")
-        mask = pd.Series(True, index=raw.index)
-        if start_date:
-            mask &= dates.isna() | (dates >= pd.Timestamp(start_date).normalize())
-        if end_date:
-            mask &= dates.isna() | (dates <= pd.Timestamp(end_date).normalize())
-        raw = raw[mask]
-    if store is not None and mapping.get("store"):
-        raw = raw[raw[mapping["store"]].astype(str) == str(store)]
-    if products:
-        wanted = {str(p) for p in products}
-        raw = raw[raw[mapping["product"]].astype(str).isin(wanted)]
+    layout = str(mapping.get("layout", "long"))
+    if layout == "wide" or mapping.get("value_columns"):
+        if not mapping.get("date"):
+            raise ValueError("A wide layout needs a date column.")
+        canonical = _melt_wide(raw, mapping, store, products, start_date, end_date, wide_missing, report, labels)
+        layout = "wide"
+    else:
+        cleaned = _clean_mapping(mapping, set(raw.columns))
+        for role in REQUIRED_ROLES:
+            if role not in cleaned:
+                raise ValueError(f"Mapping must set '{role}' to a column present in the file.")
+        frame = raw
+        if start_date or end_date:
+            parsed, date_format = _parse_dates(frame[cleaned["date"]])
+            report["date_format"] = date_format
+            mask = pd.Series(True, index=frame.index)
+            dates = parsed if parsed is not None else pd.to_datetime(frame[cleaned["date"]], errors="coerce")
+            if start_date:
+                mask &= dates.isna() | (dates >= pd.Timestamp(start_date).normalize())
+            if end_date:
+                mask &= dates.isna() | (dates <= pd.Timestamp(end_date).normalize())
+            frame = frame[mask]
+        if store is not None and cleaned.get("store"):
+            frame = frame[frame[cleaned["store"]].astype(str) == str(store)]
+        if products:
+            wanted = {str(p) for p in products}
+            frame = frame[frame[cleaned["product"]].astype(str).isin(wanted)]
+        canonical = _normalize_long(frame, cleaned, report)
 
-    canonical = normalize(raw, mapping)
     errors, warnings, _ = data_upload.validate(canonical)
     if errors:
         raise ValueError(" ".join(errors))
@@ -494,7 +673,9 @@ def prepare(path, mapping, store=None, products=None, start_date=None, end_date=
         rows=int(len(norm)), skus=int(norm["product"].nunique()),
         date_min=str(norm["date"].min().date()), date_max=str(norm["date"].max().date()),
         products=product_meta, columns=list(CANONICAL), warnings=warnings,
-        optional={role: role in mapping for role in OPTIONAL_ROLES},
+        layout=layout, report=report,
+        optional={role: (role in mapping or role in _clean_mapping(mapping, set(raw.columns)))
+                  for role in OPTIONAL_ROLES},
     )
     preview = norm.head(5).assign(date=lambda d: d["date"].dt.strftime("%Y-%m-%d")).to_dict("records")
     detected["preview"] = preview

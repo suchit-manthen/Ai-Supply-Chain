@@ -50,6 +50,20 @@ classic EOQ reference (`ORDERING_COST`, `HOLDING_RATE`).
   one store and up to eight product families, and normalizes the selection into
   the same pipeline format. Missing sales rows are excluded and missing calendar
   dates block training rather than being filled with zero.
+- **Generic CSV (auto-detect):** any other sales export is profiled column by
+  column. Each column is scored against the semantic roles `date`, `sales/demand`,
+  `product/entity`, `store` and the optional drivers (category, price, discount,
+  promotion, temperature, holiday, stock-out), and returned with a confidence
+  score and suggested mapping. Only `date + product/entity + sales` are required;
+  every other role is optional. The user confirms or overrides the mapping in the
+  UI before the file is normalized to the canonical schema, so a completely
+  different header set can feed the same model-selection and inventory pipeline.
+  The profiler also detects **wide (matrix) vs long** layouts and melds a wide
+  file into long rows; it parses many date formats (ISO, `d/m/Y` vs `m/d/Y`,
+  `YYYYMMDD` integers, textual months), aggregates duplicate `product+date`
+  rows, and reports a normalization summary (date format used, duplicates
+  collapsed, rows dropped for missing required values, wide cells filled with 0).
+  Missing optional fields fall back to neutral defaults.
 
 To try Favorita, choose **Upload CSV → Favorita train.csv**, select `train.csv`,
 then select one store, up to eight items, and a date range. The adapter scans the

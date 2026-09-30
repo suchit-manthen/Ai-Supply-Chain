@@ -123,6 +123,104 @@ def test_prepare_insufficient_history_raises(tmp_path):
         generic.prepare(path, prof["mapping"])
 
 
+def test_dates_day_first_and_yyyymmdd(tmp_path):
+    dm = pd.DataFrame({"Ref Date": [f"{i % 28 + 1:02d}/{(i // 28) % 6 + 1:02d}/2024" for i in range(140)],
+                       "SKU": "A", "Sold": [i % 4 + 1 for i in range(140)]})
+    prof = generic.profile(_write(tmp_path / "dm.csv", dm))
+    assert prof["date_format"] == "%d/%m/%Y"
+    assert prof["mapping"]["date"] == "Ref Date"
+    assert prof["mapping"]["sales"] == "Sold"
+    _, detected = generic.prepare(_write(tmp_path / "dm.csv", dm), prof["mapping"])
+    assert detected["date_min"] == "2024-01-01"
+
+    dates = pd.date_range("2024-01-01", periods=140)
+    ym = pd.DataFrame({"date": [int(d.strftime("%Y%m%d")) for d in dates], "sku": "B",
+                       "qty": [i % 3 + 1 for i in range(140)]})
+    prof2 = generic.profile(_write(tmp_path / "ym.csv", ym))
+    assert prof2["date_format"] == "%Y%m%d"
+    assert prof2["mapping"]["date"] == "date"
+    assert prof2["required"]["satisfied"] is True
+
+
+def test_wide_layout_detected_and_melted(tmp_path):
+    dates = pd.date_range("2024-01-01", periods=140)
+    wide = pd.DataFrame({"date": dates, "store": 7})
+    for name in ["PRODUCT_A", "PRODUCT_B", "PRODUCT_C"]:
+        wide[name] = [10 + i % 5 for i in range(140)]
+    path = _write(tmp_path / "wide.csv", wide)
+    prof = generic.profile(path)
+    assert prof["layout"] == "wide"
+    assert prof["mapping"]["date"] == "date"
+    assert set(prof["wide_columns"]) == {"PRODUCT_A", "PRODUCT_B", "PRODUCT_C"}
+    assert prof["required"]["satisfied"] is True
+
+    normalized, detected = generic.prepare(path, prof["mapping"])
+    out = pd.read_csv(io.BytesIO(normalized))
+    assert detected["layout"] == "wide"
+    assert detected["skus"] == 3
+    assert detected["rows"] == 420
+    assert set(out["product"]) == {"7|PRODUCT_A", "7|PRODUCT_B", "7|PRODUCT_C"}
+
+
+def test_wide_missing_cells_zero_vs_dropped(tmp_path):
+    dates = pd.date_range("2024-01-01", periods=140)
+    wide = pd.DataFrame({"date": dates})
+    for name in ["A", "B"]:
+        wide[name] = [10 + i % 4 for i in range(140)]
+    wide.loc[0, "B"] = None
+    path = _write(tmp_path / "wide_missing.csv", wide)
+    prof = generic.profile(path)
+
+    _, filled = generic.prepare(path, prof["mapping"], wide_missing="zero")
+    assert filled["report"]["wide_cells_filled_zero"] == 1
+    assert filled["rows"] == 280
+
+    _, dropped = generic.prepare(path, prof["mapping"], wide_missing="dropped")
+    assert dropped["report"]["dropped_missing_required"] == 1
+    assert dropped["rows"] == 279
+
+
+def test_normalize_report_counts_duplicates_and_drops():
+    df = pd.DataFrame({"date": ["2024-01-01", "2024-01-01", "2024-01-02", None],
+                       "product": ["A", "A", "A", "A"], "sales": [1, 2, 3, 9]})
+    report = {}
+    out = generic.normalize(df, {"date": "date", "product": "product", "sales": "sales"}, report=report)
+    assert len(out) == 2
+    assert out[out.date == pd.Timestamp("2024-01-01")].sales.iloc[0] == 3
+    assert report["dropped_missing_required"] == 1
+    assert report["duplicates_aggregated"] == 1
+    assert report["rows_in"] == 4
+    assert report["rows_out"] == 2
+
+
+def test_upload_route_prepares_wide_mapping(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    dates = pd.date_range("2024-01-01", periods=140)
+    wide = pd.DataFrame({"date": dates, "store": 3})
+    for name in ["ITEM_X", "ITEM_Y"]:
+        wide[name] = [8 + i % 4 for i in range(140)]
+    path = _write(tmp_path / "wide.csv", wide)
+    import app as api
+    try:
+        with path.open("rb") as stream:
+            result = api.app.test_client().post(
+                "/api/upload", data={"file": (stream, "wide.csv")},
+                content_type="multipart/form-data").get_json()
+        assert result["adapter"] == "generic"
+        assert result["profile"]["layout"] == "wide"
+
+        prepared = api.app.test_client().post(
+            f"/api/generic/datasets/{result['dataset_id']}/prepare",
+            json={"mapping": result["profile"]["mapping"], "wide_missing": "zero"}).get_json()
+        assert prepared["ok"] is True
+        assert prepared["detected"]["layout"] == "wide"
+        assert prepared["detected"]["skus"] == 2
+    finally:
+        for csv in (tmp_path / "uploads").glob("*-generic.csv"):
+            generic.discard(csv.name.split("-generic.")[0])
+        monkeypatch.undo()
+
+
 def test_upload_route_routes_to_generic(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "UPLOAD_DIR", str(tmp_path / "uploads"))
     df = _frame().rename(columns={"date": "ds", "entity": "sku", "sales": "qty"})
