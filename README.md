@@ -15,6 +15,63 @@ Frontend (Node 18+):
     npm install
     npm run dev                                          # open http://localhost:5173
 
+## Demo sign-in
+
+The frontend opens on a sign-in page with two demo workspaces. The credentials
+are also shown on the role cards and are prefilled when a role is selected:
+
+| Workspace | Email | Password |
+|---|---|---|
+| Store Owner | `owner@stocksense.demo` | `owner123` |
+| ML Analyst | `analyst@stocksense.demo` | `analyst123` |
+
+The Store Owner workspace opens the inventory dashboard and simulator. The ML
+Analyst workspace opens the model workbench and simulator. The session is stored
+in `localStorage` so a refresh keeps you signed in; use **Sign out** in the top
+bar to return to the login page. This is a client-side demo gate, not production
+authentication — the Flask API itself is unchanged.
+
+## Testing the app
+
+Synthetic quick start: run the two terminals above, open http://localhost:5173
+and use **Upload CSV** (or the "Train models" button for the synthetic demo).
+
+Ready-made files are in `data/samples/` (regenerate with
+`python scripts/fetch_test_data.py`):
+
+| File | Schema | Wizard path |
+|---|---|---|
+| `store_family_sample.csv` | `date,store_nbr,family,sales,onpromotion` (real Favorita "Store Sales" trim) | store + family |
+| `generic_long_sample.csv` | arbitrary headers over the same data | generic mapping |
+| `wide_sample.csv` | `date` + product columns (matrix) | generic wide |
+| `favorita_item_sample.csv` | `date,store_nbr,item_nbr,unit_sales,onpromotion` | Favorita |
+
+Each sample has one store and >=150 daily rows per series (above the 118-day
+minimum). Upload one, walk the 7 steps (upload -> understand -> map -> quality ->
+select -> inventory -> forecast) and the dashboard loads when training finishes.
+The script trims the real Favorita file with a partial HTTP Range download, so it
+stays a few MB.
+
+## Real-world datasets
+
+Further datasets that match the adapters (schemas shown), verified on the hubs:
+
+- **Favorita store + family** (Kaggle "Store Sales - Time Series Forecasting"):
+  Hugging Face `mrcksggcfc/store-sales-time-series-forecasting` and
+  `t4tiana/store-sales-time-series-forecasting` -> `train.csv`
+  (`date, store_nbr, family, sales, onpromotion`), with `stores.csv`,
+  `holidays_events.csv`, `oil.csv`, `transactions.csv`.
+- **M5 / Walmart**: Hugging Face `denephew/M5_Forecasting` ->
+  `sales_train_validation.csv` / `sales_train_evaluation.csv`
+  (wide: `id,item_id,dept_id,cat_id,store_id,state_id,d_1..`), plus
+  `calendar.csv` and `sell_prices.csv`; use the generic **wide** path.
+  `snchakri/m5-retail-demand-forecasting-benchmarks` has processed features.
+- **Kaggle CLI** (needs `~/.kaggle/kaggle.json`):
+  `kaggle competitions download -c favorita-grocery-sales-forecasting`
+  (item-level), `-c store-sales-time-series-forecasting`,
+  `-c rossmann-store-sales`, `-c walmart-recruiting-store-sales-forecasting`,
+  `-c m5-forecasting-accuracy`.
+
 ## Training vs serving
 Training is separated from the API. `python train.py` (or `POST /api/retrain`)
 runs the full pipeline and persists a run (timestamped run ID, forecasts,
@@ -34,6 +91,22 @@ abort training with a clear message. Inventory planning uses a configurable
 service level (`SERVICE_LEVEL`, or `--service-level` on `train.py`), per-SKU lead
 times, horizon-aware safety stock, a reorder point and an order quantity, with a
 classic EOQ reference (`ORDERING_COST`, `HOLDING_RATE`).
+
+### Upload wizard
+
+Every CSV goes through one guided flow (frontend `Upload.jsx` → `GenericUpload.jsx`
+or `FavoritaUpload.jsx`, stepper in `Wizard.jsx`):
+
+1. **Upload CSV** — a single entry point; the file is streamed to the backend and
+   its format detected automatically (Favorita / store+family / arbitrary).
+2. **Understand data** — layout (long/wide), date format, columns and the
+   auto-detected role mapping.
+3. **Column mapping** — confirm or change each role; for wide files pick the
+   value columns and optional id column.
+4. **Data quality** — the full-file, chunked quality report.
+5. **Store / SKU / date selection** — filters applied before the forecasting cap.
+6. **Inventory assumptions** — per-SKU stock, lead time, unit cost, service level.
+7. **Start forecasting** — review and launch.
 
 ### Dataset support
 
@@ -64,6 +137,13 @@ classic EOQ reference (`ORDERING_COST`, `HOLDING_RATE`).
   rows, and reports a normalization summary (date format used, duplicates
   collapsed, rows dropped for missing required values, wide cells filled with 0).
   Missing optional fields fall back to neutral defaults.
+- **Large files:** the generic adapter streams the raw file in chunks with **no
+  raw row cap**. Store, SKU/product and date filters are applied per chunk so a
+  huge source is reduced *before* the 200,000-row forecasting limit; only the
+  filtered, aggregated set is capped (narrow the filters if it is exceeded). The
+  same chunked scan produces a **dataset quality report** (rows scanned, invalid
+  dates, non-numeric/missing/negative sales, missing ids, entity/store counts and
+  date range), shown on upload and after preparation.
 
 To try Favorita, choose **Upload CSV → Favorita train.csv**, select `train.csv`,
 then select one store, up to eight items, and a date range. The adapter scans the
@@ -102,12 +182,37 @@ run's validation error against the naive baseline and the previous run, flagging
 deterioration above the configurable thresholds (`DRIFT_REL_THRESHOLD`,
 `DRIFT_ABS_POINTS`). The analyst dashboard's "Model runs" tab shows this.
 
+## Feature enrichment & graceful degradation
+
+- **Automatic feature use:** the model layer detects which optional drivers
+  (`discount`, `price`, `temp`, `holiday_lift`) are present *and vary* per SKU and
+  only feeds those to ARIMA/Prophet/XGBoost/Random Forest. A missing or constant
+  column (e.g. no price, or an all-zero temperature) is dropped rather than fed as
+  a meaningless zero, so all-zero placeholders cannot distort the models.
+- **Calendar / holiday enrichment:** a US holiday calendar (federal holidays plus
+  retail events such as Black Friday and Cyber Monday) drives the holiday-lift for
+  both synthetic and uploaded data automatically, and clear calendar terms
+  (day-of-week, month, day-of-year, ISO week, weekend flag, annual Fourier
+  sin/cos, holiday flag) are always available.
+- **Category / family support:** the canonical dataset carries the `category`
+  column end to end (including the future window), so the dashboard shows a
+  per-category breakdown and SKUs keep their family label. A file whose only
+  grouping column is a family/category is treated as the entity.
+- **Missing optional features:** absent drivers are filled with neutral values for
+  storage (`discount` 0, `temp` last-observed, `price` per-SKU median) and then
+  excluded from modelling when they carry no signal; the analyst view lists only
+  the features actually used.
+
 ## Model selection (data-driven, not hard-coded)
 Every SKU is evaluated against all four algorithms — ARIMA (SARIMAX), Prophet, XGBoost
 and Random Forest — using walk-forward / rolling-origin validation (3 folds). The model
 with the lowest mean validation MAPE is selected, refit on all history, and used to
 forecast the next 28 days. The naive "same day last week" (lag-7) baseline is evaluated
 on identical windows and shown for reference. No algorithm is assumed to suit any SKU.
+Prophet's yearly seasonality is enabled only when the training history spans at
+least two years (`PROPHET_YEARLY_MIN_DAYS`); on shorter series the yearly Fourier
+fit is unidentified and inflates the trend into runaway forecasts, so it is
+disabled there. All four models and the baseline share the same folds and metric.
 
 ## Forecast uncertainty & inventory
 Prediction intervals are horizon-aware: the error scale for each of the 28 days is

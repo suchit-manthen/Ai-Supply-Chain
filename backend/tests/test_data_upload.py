@@ -158,6 +158,15 @@ def test_end_to_end_uploaded_dataset(tmp_path):
     assert run["owner"]["data_source"] == "uploaded"
     assert len(run["owner"]["items"]) == 2
     assert run["analyst"]["data_source"] == "uploaded"
+    # price/temp are constant in this fixture, so only the holiday calendar is an
+    # active exogenous driver - dead features must not be advertised or fed in.
+    features = run["analyst"]["dataset"]["features"]
+    assert "holiday lift" in features
+    assert "temperature" not in features and "shelf price" not in features
+    categories = run["analyst"]["dataset"]["categories"]
+    assert categories and categories[0]["category"] == "Test"
+    usage = run["analyst"]["skus"][0]["result"]["feature_usage"]
+    assert usage["exog"] == ["holiday_lift"]  # only the varying driver is used
     for s in run["analyst"]["skus"]:
         assert len(s["result"]["forecast"]) == 28
         for pt in s["result"]["forecast"]:

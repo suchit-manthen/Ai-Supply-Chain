@@ -20,7 +20,7 @@ from config import UPLOAD_DIR, UPLOAD_MIN_TRAIN_DAYS, MAX_SKUS, MAX_UPLOAD_ROWS,
 
 REQUIRED = ["date", "product", "sales"]
 OPTIONAL = ["category", "price", "discount", "temp", "holiday_lift"]
-CANONICAL = ["date", "product", "sales", "discount", "price", "temp", "holiday_lift"]
+CANONICAL = ["date", "product", "sales", "discount", "price", "temp", "holiday_lift", "category"]
 DEFAULT_LEAD = 3
 DEFAULT_SERVICE_LEVEL = 0.95
 TEMPLATE_HEADER = "date,product,category,sales,price,discount,temp,holiday_lift"

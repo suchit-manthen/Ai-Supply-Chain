@@ -110,7 +110,7 @@ def test_prepare_end_to_end_canonical(tmp_path):
     prof = generic.profile(path)
     normalized, detected = generic.prepare(path, prof["mapping"], start_date="2024-01-01", end_date="2024-05-19")
     out = pd.read_csv(io.BytesIO(normalized))
-    assert list(out.columns) == ["date", "product", "sales", "discount", "price", "temp", "holiday_lift", "stockout"]
+    assert list(out.columns) == ["date", "product", "sales", "discount", "price", "temp", "holiday_lift", "stockout", "category"]
     assert detected["skus"] == 2
     assert detected["rows"] == 280
     assert (out["price"] > 0).all()
@@ -191,6 +191,82 @@ def test_normalize_report_counts_duplicates_and_drops():
     assert report["duplicates_aggregated"] == 1
     assert report["rows_in"] == 4
     assert report["rows_out"] == 2
+
+
+def test_large_file_streams_and_filters_before_cap(tmp_path):
+    path = tmp_path / "large.csv"
+    dates = pd.date_range("2024-01-01", periods=140)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write("date,store,product,demand\n")
+        for store in range(1, 501):
+            for product in ("P1", "P2", "P3"):
+                for d in dates:
+                    f.write(f"{d:%Y-%m-%d},{store},{product},{10 + d.day % 5}\n")
+    # 500 stores x 3 products x 140 days = 210,000 raw rows (> the 200k raw cap)
+    prof = generic.profile(path)
+    assert prof["mapping"]["sales"] == "demand"
+    assert prof["mapping"]["store"] == "store"
+
+    # Unfiltered, the forecasting set exceeds the cap and is rejected.
+    with pytest.raises(ValueError, match="exceeds"):
+        generic.prepare(path, prof["mapping"])
+
+    # Filtering one store happens per chunk, before the cap, and succeeds.
+    normalized, detected = generic.prepare(path, prof["mapping"], store="42")
+    out = pd.read_csv(io.BytesIO(normalized))
+    assert detected["rows"] == 420
+    assert detected["skus"] == 3
+    assert detected["report"]["rows_scanned"] == 210_000
+    assert detected["quality"]["rows_scanned"] == 210_000
+    assert (out["product"].str.startswith("42|")).all()
+
+
+def test_inspect_quality_report(tmp_path):
+    rows = []
+    for d in pd.date_range("2024-01-01", periods=10):
+        rows.append(dict(when=d.strftime("%Y-%m-%d"), sku="A", units=10))
+    rows[0]["when"] = "not-a-date"   # invalid date
+    rows[1]["units"] = None          # missing sales
+    rows[2]["units"] = -3            # negative sales
+    rows.append(dict(when="2024-01-03", sku="A", units=5))  # duplicate observation
+    path = _write(tmp_path / "q.csv", pd.DataFrame(rows))
+    prof = generic.profile(path)
+    quality = generic.inspect(path, prof["mapping"])
+    assert quality["rows_scanned"] == 11
+    assert quality["invalid_dates"] == 1
+    assert quality["missing_sales"] == 1
+    assert quality["negative_sales"] == 1
+    assert quality["skus"] == 1
+
+
+def test_profile_exposes_entities(tmp_path):
+    prof = generic.profile(_write(tmp_path / "e.csv", _frame()))
+    assert set(prof["entities"]) == {"A", "B"}
+
+
+def test_upload_route_canonical_file_profiles(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "UPLOAD_DIR", str(tmp_path / "uploads"))
+    df = _frame().rename(columns={"entity": "product"})  # canonical date, product, sales
+    path = _write(tmp_path / "canonical.csv", df)
+    import app as api
+    try:
+        with path.open("rb") as stream:
+            result = api.app.test_client().post(
+                "/api/upload", data={"file": (stream, "canonical.csv")},
+                content_type="multipart/form-data").get_json()
+        assert result["adapter"] == "generic"
+        assert result["profile"]["mapping"]["product"] == "product"
+        assert result["profile"]["required"]["satisfied"] is True
+
+        prepared = api.app.test_client().post(
+            f"/api/generic/datasets/{result['dataset_id']}/prepare",
+            json={"mapping": result["profile"]["mapping"]}).get_json()
+        assert prepared["ok"] is True
+        assert prepared["detected"]["skus"] == 2
+    finally:
+        for csv in (tmp_path / "uploads").glob("*-generic.csv"):
+            generic.discard(csv.name.split("-generic.")[0])
+        monkeypatch.undo()
 
 
 def test_upload_route_prepares_wide_mapping(tmp_path, monkeypatch):

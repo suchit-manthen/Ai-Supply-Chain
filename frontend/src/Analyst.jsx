@@ -25,9 +25,11 @@ function Overview({ d }) {
             <Bar dataKey="baseline" fill="#c9d1c6" name="Naive baseline" /><Bar dataKey="model" name="ML model">{lb.map(r => <Cell key={r.name} fill={r.color} />)}</Bar>
           </BarChart></Chart>
         </Card>
-        <Card t="Dataset" s={`${fmt(d.dataset.rows)} daily records · ${d.dataset.skus} products · ${d.dataset.start} to ${d.dataset.end}`}>
+        <Card t="Dataset" s={`${fmt(d.dataset.rows)} daily records · ${d.dataset.skus} products${d.dataset.categories?.length ? ` · ${d.dataset.categories.length} categories` : ''} · ${d.dataset.start} to ${d.dataset.end}`}>
           <Chart h={200}><BarChart data={d.dataset.monthly} margin={{ left: -10 }}><CartesianGrid vertical={false} stroke="#e6ebe3" /><XAxis dataKey="month" fontSize={11} minTickGap={25} /><YAxis fontSize={11} /><Tooltip /><Bar dataKey="units" fill="#2c7a4b" name="Units sold" /></BarChart></Chart>
-          <p className="sub" style={{ marginTop: 8 }}>Inputs: {d.dataset.features.join(', ')}. {d.data_source === 'synthetic' ? 'Synthetic demo data models weekly cycles, annual seasons, holidays, promotions with price elasticity, weather and 5% yearly growth; it is not real store data.' : d.data_source === 'favorita' ? 'Favorita subset. onpromotion is used as a binary promotion signal. Unit price, weather and stock are not in train.csv; neutral placeholders are used for unavailable model inputs.' : 'Uploaded historical data. The next 28 days assume 0% discount, last observed price and temperature, and calendar-derived holiday lift; no future promotion/weather schedule is provided.'}</p>
+          <p className="sub" style={{ marginTop: 8 }}>Inputs: {d.dataset.features.join(', ')}. Only optional drivers that are present and vary are used; missing or constant columns (e.g. an unavailable price or temperature) are dropped rather than fed as zeros.</p>
+          {d.dataset.categories?.length > 0 && <p className="sub"><b>By category:</b> {d.dataset.categories.map(c => `${c.category} (${fmt(c.units)})`).join(' · ')}</p>}
+          <p className="sub">{d.data_source === 'synthetic' ? 'Synthetic demo data models weekly cycles, annual seasons, holidays, promotions with price elasticity, weather and 5% yearly growth; it is not real store data.' : d.data_source === 'favorita' ? 'Favorita subset. onpromotion is used as a binary promotion signal. Unit price, weather and stock are not in train.csv; neutral placeholders are used for unavailable model inputs.' : 'Uploaded historical data. The next 28 days assume 0% discount, last observed price and temperature, and calendar-derived holiday lift; no future promotion/weather schedule is provided.'}</p>
         </Card>
       </div>
 

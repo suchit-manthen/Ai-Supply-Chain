@@ -7,8 +7,8 @@ MODELS = {"ARIMA", "Prophet", "XGBoost", "Random Forest"}
 
 
 def test_products_configuration():
-    assert len(PRODUCTS) == 8
-    assert len({p["id"] for p in PRODUCTS}) == 8
+    assert len(PRODUCTS) == 16
+    assert len({p["id"] for p in PRODUCTS}) == 16
     # legacy_model is reference-only metadata
     assert {p["legacy_model"] for p in PRODUCTS} <= MODELS
     assert all("model" not in p for p in PRODUCTS)

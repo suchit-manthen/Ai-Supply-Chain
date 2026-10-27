@@ -87,10 +87,13 @@ def validate_sales(df, product_ids=None):
 
 
 def load_synthetic(seed=SEED):
-    """Existing generator; adds an explicit (all-zero) stockout column."""
+    """Existing generator; adds stockout and category columns."""
     df, end, hol = generate(seed)
     if "stockout" not in df.columns:
         df = df.assign(stockout=0)
+    if "category" not in df.columns:
+        categories = {p["id"]: p["category"] for p in PRODUCTS}
+        df = df.assign(category=df["product"].map(categories).fillna("Unknown"))
     return df, end, hol
 
 
@@ -127,19 +130,28 @@ def load_csv(path, seed=SEED):
     hol = holiday_table(range(hist["date"].min().year, (end + pd.Timedelta(days=HORIZON)).year + 1))
     hist["holiday_lift"] = _holiday_lift(pd.DatetimeIndex(hist["date"]), hol)
 
+    has_category = "category" in hist.columns
     future_dates = pd.date_range(end + pd.Timedelta(days=1), periods=HORIZON, freq="D")
     hl_future = _holiday_lift(pd.DatetimeIndex(future_dates), hol)
     frames = [hist]
     for pid in hist["product"].unique():
         last = hist[hist["product"] == pid].iloc[-1]
-        frames.append(pd.DataFrame(dict(
+        future = dict(
             date=future_dates, product=pid, sales=np.nan, discount=0.0,
             price=float(last["price"]) if pd.notna(last["price"]) else 0.0,
             temp=float(last["temp"]) if pd.notna(last["temp"]) else 0.0,
             holiday_lift=hl_future, stockout=0,
-        )))
+        )
+        if has_category:
+            last_category = last.get("category", "Unknown")
+            future["category"] = last_category if pd.notna(last_category) else "Unknown"
+        frames.append(pd.DataFrame(future))
     combined = pd.concat(frames, ignore_index=True)
-    return combined[["date", "product", "sales", "discount", "price", "temp", "holiday_lift", "stockout"]], end, hol
+    columns = ["date", "product", "sales", "discount", "price", "temp", "holiday_lift", "stockout"]
+    if has_category:
+        combined["category"] = combined["category"].fillna("Unknown")
+        columns = columns + ["category"]
+    return combined[columns], end, hol
 
 
 def load_data(source=None, seed=SEED):

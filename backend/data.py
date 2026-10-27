@@ -36,6 +36,30 @@ PRODUCTS = [
     dict(id="bread", name="Sliced Bread", category="Bakery", legacy_model="Random Forest", base=310, price=1.80, cost=1.05,
          lead=1, shelf=3, stock_days=3.8, on_order=0, max_cover=3,
          weekly=[1.05, .95, .93, .95, 1.0, 1.1, 1.08], season=.02, temp=0.0, promo=.5, holiday=.10, noise=.11),
+    dict(id="eggs", name="Free Range Eggs 12 Pack", category="Dairy", legacy_model="ARIMA", base=125, price=4.20, cost=2.75,
+         lead=2, shelf=28, stock_days=4.5, on_order=0, max_cover=18,
+         weekly=[.92, .9, .94, .97, 1.02, 1.15, 1.1], season=.03, temp=0.0, promo=.45, holiday=.12, noise=.08),
+    dict(id="yogurt", name="Greek Yogurt 500g", category="Dairy", legacy_model="Prophet", base=82, price=3.60, cost=2.20,
+         lead=3, shelf=21, stock_days=2.3, on_order=0, max_cover=12,
+         weekly=[.9, .88, .94, .98, 1.05, 1.18, 1.12], season=.08, temp=.006, promo=.8, holiday=.16, noise=.11),
+    dict(id="chicken", name="Chicken Breast 1kg", category="Meat", legacy_model="Random Forest", base=74, price=8.90, cost=6.10,
+         lead=2, shelf=5, stock_days=1.4, on_order=0, max_cover=4,
+         weekly=[.82, .84, .9, .98, 1.12, 1.28, 1.3], season=.04, temp=0.0, promo=.55, holiday=.2, noise=.12),
+    dict(id="apples", name="Gala Apples 1kg", category="Produce", legacy_model="XGBoost", base=105, price=3.40, cost=2.00,
+         lead=2, shelf=18, stock_days=3.2, on_order=0, max_cover=12,
+         weekly=[.92, .9, .94, .98, 1.03, 1.15, 1.14], season=.16, temp=.003, promo=.6, holiday=.12, noise=.10),
+    dict(id="pasta", name="Pasta 500g", category="Staples", legacy_model="ARIMA", base=68, price=1.70, cost=0.95,
+         lead=4, shelf=365, stock_days=12, on_order=0, max_cover=35,
+         weekly=[.88, .9, .92, .96, 1.02, 1.16, 1.12], season=.04, temp=0.0, promo=.9, holiday=.18, noise=.09),
+    dict(id="coffee", name="Ground Coffee 250g", category="Beverages", legacy_model="Prophet", base=46, price=6.80, cost=4.20,
+         lead=5, shelf=270, stock_days=8, on_order=0, max_cover=30,
+         weekly=[.94, .95, 1.0, 1.02, 1.06, 1.03, 1.0], season=.06, temp=0.0, promo=1.1, holiday=.3, noise=.12),
+    dict(id="detergent", name="Laundry Detergent 2L", category="Household", legacy_model="XGBoost", base=31, price=8.50, cost=5.60,
+         lead=7, shelf=730, stock_days=18, on_order=0, max_cover=60,
+         weekly=[.9, .92, .95, .98, 1.0, 1.12, 1.1], season=.03, temp=0.0, promo=1.25, holiday=.35, noise=.10),
+    dict(id="papertowels", name="Paper Towels 6 Roll Pack", category="Household", legacy_model="Random Forest", base=39, price=5.20, cost=3.10,
+         lead=5, shelf=730, stock_days=9, on_order=0, max_cover=40,
+         weekly=[.9, .91, .94, .98, 1.0, 1.16, 1.14], season=.02, temp=0.0, promo=.85, holiday=.25, noise=.09),
 ]
 
 
@@ -45,12 +69,38 @@ def _nth_weekday(year, month, weekday, n):
     return d + pd.Timedelta(weeks=n - 1)
 
 
+def _last_weekday(year, month, weekday):
+    d = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
+    return d - pd.Timedelta(days=(d.weekday() - weekday) % 7)
+
+
 def holiday_table(years):
+    """US calendar of holidays and retail events used for enrichment.
+
+    Each row is (name, date). The demand-lift derived from this table feeds the
+    models automatically for both synthetic and uploaded data.
+    """
     rows = []
     for y in years:
-        rows += [("New Year", pd.Timestamp(y, 1, 1)), ("Valentine's Day", pd.Timestamp(y, 2, 14)),
-                 ("Halloween", pd.Timestamp(y, 10, 31)), ("Thanksgiving", _nth_weekday(y, 11, 3, 4)),
-                 ("Christmas", pd.Timestamp(y, 12, 25)), ("New Year's Eve", pd.Timestamp(y, 12, 31))]
+        thanksgiving = _nth_weekday(y, 11, 3, 4)
+        rows += [
+            ("New Year", pd.Timestamp(y, 1, 1)),
+            ("Martin Luther King Jr. Day", _nth_weekday(y, 1, 0, 3)),
+            ("Valentine's Day", pd.Timestamp(y, 2, 14)),
+            ("Presidents' Day", _nth_weekday(y, 2, 0, 3)),
+            ("Memorial Day", _last_weekday(y, 5, 0)),
+            ("Juneteenth", pd.Timestamp(y, 6, 19)),
+            ("Independence Day", pd.Timestamp(y, 7, 4)),
+            ("Labor Day", _nth_weekday(y, 9, 0, 1)),
+            ("Halloween", pd.Timestamp(y, 10, 31)),
+            ("Columbus Day", _nth_weekday(y, 10, 0, 2)),
+            ("Veterans Day", pd.Timestamp(y, 11, 11)),
+            ("Thanksgiving", thanksgiving),
+            ("Black Friday", thanksgiving + pd.Timedelta(days=1)),
+            ("Cyber Monday", thanksgiving + pd.Timedelta(days=4)),
+            ("Christmas", pd.Timestamp(y, 12, 25)),
+            ("New Year's Eve", pd.Timestamp(y, 12, 31)),
+        ]
     return pd.DataFrame(rows, columns=["holiday", "ds"])
 
 

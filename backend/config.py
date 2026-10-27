@@ -20,6 +20,11 @@ MAX_FORECAST_ROWS = 200000   # maximum normalized records passed into model trai
 # --- Forecast setup ---------------------------------------------------------
 HORIZON = 28          # days to forecast
 HOLDOUT = 28          # validation days used by the single-split backtest
+# Prophet only identifies a yearly seasonal cycle with roughly two years of
+# history; on a shorter series the yearly Fourier terms are unstable and inflate
+# the trend (Prophet's own "less than 730 days" warning). Below this span we fit
+# without yearly seasonality.
+PROPHET_YEARLY_MIN_DAYS = 730
 
 # --- Reproducibility --------------------------------------------------------
 SEED = 42             # seed for the synthetic data generator

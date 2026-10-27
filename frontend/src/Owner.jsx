@@ -1,136 +1,177 @@
-import { useMemo, useState } from 'react'
-import { ResponsiveContainer, ComposedChart, Line, Area, XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine } from 'recharts'
-import { Kpi, Pill, RiskPill, fmt, usd, short, STATUS_COLOR } from './ui.jsx'
+import { useMemo, useState } from 'react';
+import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
+import { fmt, usd, short } from './ui';
 
-function ForecastChart({ series, height = 260 }) {
-  const firstPred = series.find(s => s.pred !== undefined)?.date
-  const data = series.map(s => ({ ...s, band: s.lo !== undefined ? [s.lo, s.hi] : undefined }))
-  return (
-    <ResponsiveContainer width="100%" height={height}>
-      <ComposedChart data={data} margin={{ left: -10, right: 8 }}>
-        <CartesianGrid stroke="#e6ebe3" vertical={false} />
-        <XAxis dataKey="date" tickFormatter={short} minTickGap={30} fontSize={12} />
-        <YAxis fontSize={12} />
-        <Tooltip labelFormatter={short} />
-        <Area dataKey="band" stroke="none" fill="#2c7a4b" fillOpacity={.15} name="80% range" />
-        <Line dataKey="actual" stroke="#16261f" dot={false} strokeWidth={2} name="Actual sales" />
-        <Line dataKey="pred" stroke="#2c7a4b" dot={false} strokeWidth={2.5} strokeDasharray="5 3" name="Forecast" />
-        <ReferenceLine x={firstPred} stroke="#999" label={{ value: 'today', fontSize: 11, position: 'top' }} />
-      </ComposedChart>
-    </ResponsiveContainer>
-  )
+const severity = (item) => {
+  if (item.status === 'Critical') return 0;
+  if (item.status === 'Reorder') return 1;
+  if (item.stockout_risk === 'High' || item.stockout_risk === 'Elevated') return 2;
+  if (item.status === 'Overstock') return 3;
+  return 4;
+};
+
+const labelFor = (item) => {
+  if (item.status === 'Critical') return 'Running Low';
+  if (item.status === 'Reorder') return 'Reorder Now';
+  if (item.status === 'Overstock') return 'Overstocked';
+  if (item.stockout_risk === 'High' || item.stockout_risk === 'Elevated') return 'Running Low';
+  return 'Healthy';
+};
+
+const messageFor = (item) => {
+  const label = labelFor(item);
+  if (label === 'Running Low') return 'Stock may run out before the next delivery.';
+  if (label === 'Reorder Now') return 'Stock is below the level needed for the next delivery.';
+  if (label === 'Overstocked') return 'There is more stock than expected demand needs.';
+  return 'Enough stock for now.';
+};
+
+const statusClass = (item) => item.status || 'Healthy';
+const daysText = (value) => value == null || !Number.isFinite(Number(value)) ? '—' : `${fmt(value)} days`;
+
+function SalesOverview({ data }) {
+  const chartData = data || [];
+  return <section className="owner-panel owner-sales" aria-labelledby="owner-sales-title">
+    <div className="owner-panel-heading">
+      <div><h2 id="owner-sales-title">Sales Overview</h2><p>Recent sales and the forecast</p></div>
+      <div className="owner-legend"><span><i className="actual" />Actual sales</span><span><i className="predicted" />Predicted sales</span></div>
+    </div>
+    {chartData.length ? <div className="owner-chart">
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={chartData} margin={{ top: 8, right: 12, left: -18, bottom: 0 }}>
+          <CartesianGrid stroke="#e8ece5" vertical={false} />
+          <XAxis dataKey="date" tickFormatter={short} tick={{ fontSize: 11, fill: '#738078' }} axisLine={false} tickLine={false} minTickGap={24} />
+          <YAxis tick={{ fontSize: 11, fill: '#738078' }} axisLine={false} tickLine={false} width={42} />
+          <Tooltip labelFormatter={short} formatter={(value, name) => [fmt(value), name === 'actual' ? 'Actual sales' : 'Predicted sales']} contentStyle={{ borderRadius: 8, borderColor: '#dfe5dc', fontSize: 12 }} />
+          <Line type="monotone" dataKey="actual" name="actual" stroke="#397b53" strokeWidth={2} dot={false} connectNulls />
+          <Line type="monotone" dataKey="pred" name="pred" stroke="#93a879" strokeWidth={2} strokeDasharray="5 4" dot={false} connectNulls />
+        </LineChart>
+      </ResponsiveContainer>
+    </div> : <div className="owner-empty">Sales history is not available yet.</div>}
+  </section>;
 }
 
 export default function Owner({ d }) {
-  const [sel, setSel] = useState(d.items[0].id)
-  const [overrides, setOverrides] = useState({})
-  const baseItem = d.items.find(i => i.id === sel)
-  const item = useMemo(() => {
-    const o = overrides[baseItem.id] || {}
-    const stock = Math.max(0, Number(o.stock ?? baseItem.stock) || 0)
-    const onOrder = Math.max(0, Number(o.on_order ?? baseItem.on_order) || 0)
-    const lead = Math.max(1, Number(o.lead ?? baseItem.lead) || 1)
-    const service = Number(o.service_level ?? baseItem.service_level ?? d.service_level) || d.service_level
-    const unitCost = Math.max(0, Number(o.cost ?? baseItem.cost) || 0)
-    const forecastRows = baseItem.series.filter(x => x.pred !== undefined)
-    const z = service >= .99 ? 2.326 : service >= .95 ? 1.645 : 1.282
-    const safety = Math.ceil(z * Math.sqrt(baseItem.safety ** 2 / 1.645 ** 2 * (lead / baseItem.lead)))
-    const demand = forecastRows.slice(0, lead).reduce((a, x) => a + x.pred, 0)
-    const upperDemand = forecastRows.slice(0, lead).reduce((a, x) => a + (x.hi ?? x.pred), 0)
-    const qty = Math.max(0, Math.ceil((forecastRows.slice(0, lead + 7).reduce((a, x) => a + x.pred, 0) + safety - stock - onOrder) / 10) * 10)
-    const coverDays = (() => { let remaining = stock; for (let i = 0; i < forecastRows.length; i++) { if (remaining < forecastRows[i].pred) return i; remaining -= forecastRows[i].pred } return baseItem.cover_days })()
-    const status = stock < demand ? 'Critical' : stock + onOrder < demand + safety ? 'Reorder' : coverDays > 14 ? 'Overstock' : 'Healthy'
-    const risk = stock < demand ? 'High' : stock < upperDemand ? 'Elevated' : 'Low'
-    return { ...baseItem, stock, on_order: onOrder, lead, service_level: service, cost: unitCost, safety, demand_lead: Math.round(demand), demand_lead_upper: Math.round(upperDemand), rop: Math.round(demand + safety), order_qty: qty, order_cost: Math.round(qty * unitCost * 100) / 100,
-      cover_days: coverDays, status, stockout_risk: risk,
-      inventory_position: stock + onOrder, message: `Scenario: ${stock} on hand + ${onOrder} on order; ${lead}-day lead time; ${Math.round(service * 100)}% service level.` }
-  }, [baseItem, overrides, d.service_level])
-  const setOverride = (key, value) => setOverrides(v => ({ ...v, [item.id]: { ...v[item.id], [key]: value } }))
-  const k = d.kpis
-  const alerts = d.items.filter(i => i.status !== 'Healthy' || i.stockout_risk !== 'Low')
-  return (
-    <>
-      <div className="head">
-        <div><h1>Store inventory outlook</h1><p>Forecast for the next {d.horizon} days, based on sales up to {short(d.as_of)}.</p></div>
-      </div>
-      <div className="kpis">
-        <Kpi v={k.critical} l="Products at risk of running out" c="#d43f2b" />
-        <Kpi v={k.reorder} l="Products to reorder today" c="#d99a12" />
-        <Kpi v={k.overstock} l="Overstocked products" c="#3b5bdb" />
-        <Kpi v={k.healthy} l="Healthy products" c="#2c7a4b" />
-        <Kpi v={usd(k.order_cost)} l={`Purchase needed today (${fmt(k.order_units)} units)`} c="#7048c8" />
-        <Kpi v={usd(k.revenue_7)} l="Expected sales, next 7 days" c="#16261f" />
-      </div>
+  const [sel, setSel] = useState(d?.items?.[0]?.id ?? null);
+  const [overrides, setOverrides] = useState({});
+  const [sort, setSort] = useState({ key: 'priority', dir: 1 });
 
-      <div className="grid2" style={{ gridTemplateColumns: '1.1fr 1fr' }}>
-        <section className="card">
-          <h3>What to do today</h3>
-          <p className="sub">Sorted by urgency. Click a product for its forecast.</p>
-          {alerts.map(a => (
-            <div key={a.id} className={'alert ' + a.status} onClick={() => setSel(a.id)} style={{ cursor: 'pointer' }}>
-              <div style={{ flex: 1 }}>
-                <b>{a.name} <Pill s={a.status} /></b>
-                <small>{a.message}</small>
-              </div>
-              {a.order_qty > 0 && <div style={{ textAlign: 'right' }}><b>{fmt(a.order_qty)}</b><small>units to order</small></div>}
-            </div>
-          ))}
-          {!alerts.length && <div className="empty">Everything is well stocked — no products need action today.</div>}
-        </section>
-        <section className="card">
-          <h3>Total units sold per day</h3>
-          <p className="sub">All products combined: last 5 weeks and next 4 weeks.</p>
-          <ForecastChart series={d.total} height={280} />
-        </section>
-      </div>
+  const items = d?.items || [];
+  const k = d?.kpis || {};
+  const selected = items.find((item) => item.id === sel) || items[0];
 
-      <section className="card">
-        <h3>Stock plan by product</h3>
-        <p className="sub">Reorder point = demand during delivery time + safety stock. Order quantity covers delivery time plus one week.</p>
-        <div className="scroll"><table className="tbl">
-          <thead><tr><th>Product</th><th>Status</th><th>Stockout risk</th><th className="num">In stock</th><th>Days of cover</th><th className="num">Sales next 7d</th><th className="num">Expected before delivery</th><th className="num">If demand is high</th><th className="num">Delivery (days)</th><th className="num">Safety stock</th><th className="num">Reorder point</th><th className="num">Order qty</th></tr></thead>
-          <tbody>{d.items.map(i => (
-            <tr key={i.id} className="row" onClick={() => setSel(i.id)} style={i.id === sel ? { background: '#eef3ea' } : null}>
-              <td><b>{i.name}</b><br /><small style={{ color: '#5f6f66' }}>{i.category}</small></td>
-              <td><Pill s={i.status} /></td>
-              <td><RiskPill r={i.stockout_risk} /></td>
-              <td className="num">{fmt(i.stock)}</td>
-              <td><div className="bar"><i style={{ width: Math.min(100, i.cover_days / 20 * 100) + '%', background: STATUS_COLOR[i.status] }} /></div><small>{i.cover_days} days</small></td>
-              <td className="num">{fmt(i.forecast_7)}</td>
-              <td className="num">{fmt(i.demand_lead)}</td>
-              <td className="num">{fmt(i.demand_lead_upper)}</td>
-              <td className="num">{i.lead}</td>
-              <td className="num">{fmt(i.safety)}</td><td className="num">{fmt(i.rop)}</td>
-              <td className="num"><b>{i.order_qty ? fmt(i.order_qty) : '–'}</b></td>
-            </tr>))}</tbody>
-        </table></div>
+  const attention = useMemo(() => [...items]
+    .filter((item) => severity(item) < 4)
+    .sort((a, b) => severity(a) - severity(b) || (Number(a.cover_days) || 0) - (Number(b.cover_days) || 0))
+    .slice(0, 5), [items]);
+
+  const sortedItems = useMemo(() => [...items].sort((a, b) => {
+    const { key, dir } = sort;
+    if (key === 'priority') return (severity(a) - severity(b)) * dir;
+    if (key === 'name') return String(a.name || a.id).localeCompare(String(b.name || b.id)) * dir;
+    if (key === 'status') return (severity(a) - severity(b)) * dir;
+    const av = Number(a[key]); const bv = Number(b[key]);
+    return ((Number.isFinite(av) ? av : -Infinity) - (Number.isFinite(bv) ? bv : -Infinity)) * dir;
+  }), [items, sort]);
+
+  const detail = useMemo(() => {
+    if (!selected) return null;
+    const override = overrides[selected.id] || {};
+    const stock = Math.max(0, Number(override.stock ?? selected.stock) || 0);
+    const onOrder = Math.max(0, Number(override.on_order ?? selected.on_order) || 0);
+    const lead = Math.max(1, Number(override.lead ?? selected.lead) || 1);
+    const service = Number(override.service_level ?? selected.service_level ?? d.service_level) || d.service_level;
+    const unitCost = Math.max(0, Number(override.cost ?? selected.cost) || 0);
+    const forecastRows = (selected.series || []).filter((row) => row.pred !== undefined);
+    const z = service >= 0.99 ? 2.326 : service >= 0.95 ? 1.645 : 1.282;
+    const safety = Math.ceil(z * Math.sqrt((selected.safety ** 2) / (1.645 ** 2) * (lead / selected.lead)));
+    const leadDemand = forecastRows.slice(0, lead).reduce((sum, row) => sum + row.pred, 0);
+    const upperDemand = forecastRows.slice(0, lead).reduce((sum, row) => sum + (row.hi ?? row.pred), 0);
+    const orderQty = Math.max(0, Math.ceil((forecastRows.slice(0, lead + 7).reduce((sum, row) => sum + row.pred, 0) + safety - stock - onOrder) / 10) * 10);
+    let cover = selected.cover_days;
+    let remaining = stock;
+    for (let index = 0; index < forecastRows.length; index += 1) {
+      if (remaining < forecastRows[index].pred) { cover = index; break; }
+      remaining -= forecastRows[index].pred;
+    }
+    const status = stock < leadDemand ? 'Critical' : stock + onOrder < leadDemand + safety ? 'Reorder' : cover > 14 ? 'Overstock' : 'Healthy';
+    const risk = stock < leadDemand ? 'High' : stock < upperDemand ? 'Elevated' : 'Low';
+    return { stock, onOrder, lead, service, unitCost, daily: forecastRows[0]?.pred || 0, safety, leadDemand, orderQty, cover, status, risk };
+  }, [selected, overrides]);
+
+  const updateOverride = (key, value) => {
+    if (!selected) return;
+    setOverrides((prev) => ({ ...prev, [selected.id]: { ...prev[selected.id], [key]: value } }));
+  };
+
+  const showDetails = (item) => {
+    setSel(item.id);
+    window.setTimeout(() => document.getElementById('owner-product-details')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
+  };
+
+  const toggleSort = (key) => setSort((current) => ({ key, dir: current.key === key ? -current.dir : 1 }));
+  const sortButton = (key, label) => <button type="button" className="owner-sort" onClick={() => toggleSort(key)} aria-label={`Sort by ${label}`} aria-sort={sort.key === key ? (sort.dir === 1 ? 'ascending' : 'descending') : 'none'}>{label}{sort.key === key ? <span aria-hidden="true">{sort.dir === 1 ? ' ↑' : ' ↓'}</span> : null}</button>;
+
+  if (!d || !Array.isArray(d.items)) return <div className="owner-dashboard"><div className="owner-empty">Store data could not be loaded. Please refresh and try again.</div></div>;
+  if (!items.length) return <div className="owner-dashboard"><div className="owner-empty">No products are available yet.</div></div>;
+
+  const summaries = [
+    { title: 'Needs Reordering', value: Number(k.critical || 0) + Number(k.reorder || 0), note: 'Products to order' },
+    { title: 'Running Low', value: items.filter((item) => item.status === 'Critical' || item.stockout_risk === 'High' || item.stockout_risk === 'Elevated').length, note: 'At risk of running out' },
+    { title: 'Healthy Stock', value: k.healthy ?? items.filter((item) => statusClass(item) === 'Healthy').length, note: 'Enough stock for now' },
+    { title: 'Overstocked', value: k.overstock ?? items.filter((item) => item.status === 'Overstock').length, note: 'More than currently needed' },
+  ];
+
+  return <main className="owner-dashboard">
+    <header className="owner-page-heading"><div><span className="owner-eyebrow">STORE OVERVIEW</span><h1>Good day. Here’s your stock at a glance.</h1><p>See what needs attention and what you may need to order.</p></div><span className="owner-product-count">{fmt(items.length)} products</span></header>
+
+    <section className="owner-summary" aria-label="Inventory summary">
+      {summaries.map((item) => <article className="owner-summary-card" key={item.title}><span>{item.title}</span><strong>{fmt(item.value)}</strong><small>{item.note}</small></article>)}
+    </section>
+
+    <div className="owner-main-grid">
+      <section className="owner-panel owner-attention" aria-labelledby="owner-attention-title">
+        <div className="owner-panel-heading"><div><h2 id="owner-attention-title">Needs Your Attention</h2><p>Your most urgent stock decisions</p></div><a href="#owner-all-products" className="owner-text-link">View all products <span aria-hidden="true">→</span></a></div>
+        {attention.length ? <div className="owner-attention-list">{attention.map((item) => <article className="owner-attention-row" key={item.id}>
+          <div className="owner-attention-product"><div className="owner-product-name">{item.name || item.id}</div><span className={`owner-status ${statusClass(item)}`}>{labelFor(item)}</span><p>{messageFor(item)}</p></div>
+          <div className="owner-attention-stock"><span>Stock available</span><strong>{fmt(item.stock)}</strong></div>
+          <div className="owner-attention-stock"><span>Estimated days left</span><strong>{daysText(item.cover_days)}</strong></div>
+          <div className="owner-attention-order"><span>Recommended order</span><strong>{Number(item.order_qty) > 0 ? fmt(item.order_qty) : '—'}</strong></div>
+          <button type="button" className="owner-view-button" onClick={() => showDetails(item)}>View details</button>
+        </article>)}</div> : <div className="owner-empty">All products are in good shape. There are no urgent actions right now.</div>}
       </section>
+      <SalesOverview data={d.total} />
+    </div>
 
-      <section className="card">
-        <h3>{item.name}: demand forecast</h3>
-        <p className="sub">Solid line is past sales, dashed line is the forecast, shaded area is the likely range (it widens further ahead). Forecast made with {item.model}{d.data_source === 'synthetic' ? ' using synthetic demo data.' : '.'}</p>
-        <ForecastChart series={item.series} />
-        <h3>Inventory scenario planner</h3>
-        <p className="sub">Adjust these assumptions to see how the order suggestion changes. Changes are a local planning scenario and are not saved to your inventory system.</p>
-        <div className="stat scenario-inputs">
-          <label>Current stock<input className="numin" type="number" min="0" value={item.stock} onChange={e => setOverride('stock', e.target.value)} /></label>
-          <label>On order<input className="numin" type="number" min="0" value={item.on_order} onChange={e => setOverride('on_order', e.target.value)} /></label>
-          <label>Lead time days<input className="numin" type="number" min="1" value={item.lead} onChange={e => setOverride('lead', e.target.value)} /></label>
-          <label>Unit cost<input className="numin" type="number" min="0" step="0.01" value={item.cost} onChange={e => setOverride('cost', e.target.value)} /></label>
-          <label>Service level<select className="numin" value={item.service_level} onChange={e => setOverride('service_level', e.target.value)}><option value={.90}>90%</option><option value={.95}>95%</option><option value={.99}>99%</option></select></label>
+    <section className="owner-panel owner-products" id="owner-all-products" aria-labelledby="owner-products-title">
+      <div className="owner-panel-heading"><div><h2 id="owner-products-title">All Products</h2><p>Current inventory and recommended orders</p></div><span className="owner-table-count">{fmt(items.length)} products</span></div>
+      <div className="owner-table-wrap"><table className="owner-table"><thead><tr>
+        <th>{sortButton('name', 'Product')}</th><th>{sortButton('stock', 'Stock Available')}</th><th>{sortButton('cover_days', 'Days Remaining')}</th><th>{sortButton('status', 'Status')}</th><th>{sortButton('order_qty', 'Recommended Order')}</th>
+      </tr></thead><tbody>{sortedItems.map((item) => <tr key={item.id} className={sel === item.id ? 'selected' : ''} onClick={() => setSel(item.id)}>
+        <td data-label="Product"><button type="button" className="owner-product-link" onClick={(event) => { event.stopPropagation(); setSel(item.id); }}>{item.name || item.id}</button></td>
+        <td data-label="Stock Available">{fmt(item.stock)}</td><td data-label="Days Remaining">{daysText(item.cover_days)}</td>
+        <td data-label="Status"><span className={`owner-status ${statusClass(item)}`}>{labelFor(item)}</span></td><td data-label="Recommended Order">{Number(item.order_qty) > 0 ? fmt(item.order_qty) : '—'}</td>
+      </tr>)}</tbody></table></div>
+    </section>
+
+    {selected && detail && <section className="owner-panel owner-details" id="owner-product-details" aria-labelledby="owner-details-title">
+      <div className="owner-panel-heading"><div><span className="owner-eyebrow">PRODUCT DETAILS</span><h2 id="owner-details-title">{selected.name || selected.id}</h2><p>{messageFor({ ...selected, status: detail.status, stockout_risk: detail.risk })}</p></div><span className={`owner-status ${detail.status}`}>{labelFor({ ...selected, status: detail.status, stockout_risk: detail.risk })}</span></div>
+      <div className="owner-detail-metrics">
+        <div><span>Stock available</span><strong>{fmt(detail.stock)}</strong></div><div><span>On order</span><strong>{fmt(detail.onOrder)}</strong></div><div><span>Estimated days remaining</span><strong>{daysText(detail.cover)}</strong></div><div><span>Recommended order</span><strong>{detail.orderQty > 0 ? fmt(detail.orderQty) : 'No order needed'}</strong></div>
+      </div>
+      <p className="owner-detail-note">Order estimate uses this product’s expected sales before delivery and current stock on hand and on order.</p>
+      <details className="owner-assumptions"><summary>Adjust planning assumptions</summary><p>These changes update this estimate on your screen only; they do not change your saved inventory.</p>
+        <div className="owner-input-grid">
+          <label>Stock available<input type="number" min="0" value={detail.stock} onChange={(event) => updateOverride('stock', Number(event.target.value))} /></label>
+          <label>Stock on order<input type="number" min="0" value={detail.onOrder} onChange={(event) => updateOverride('on_order', Number(event.target.value))} /></label>
+          <label>Delivery lead time (days)<input type="number" min="1" value={detail.lead} onChange={(event) => updateOverride('lead', Number(event.target.value))} /></label>
+          <label>Service level (%)<input type="number" min="50" max="99.9" step="0.1" value={Number(detail.service) <= 1 ? Number(detail.service) * 100 : detail.service} onChange={(event) => updateOverride('service_level', Number(event.target.value) / 100)} /></label>
+          <label>Product cost<input type="number" min="0" step="0.01" value={detail.unitCost} onChange={(event) => updateOverride('cost', Number(event.target.value))} /></label>
         </div>
-        <div className="stat">
-          <div><b>{fmt(item.stock)}</b><span>units in stock</span></div>
-          <div><b>{fmt(item.inventory_position)}</b><span>inventory position (stock + on order)</span></div>
-          <div><b>{fmt(item.demand_lead)}</b><span>expected sales before delivery</span></div>
-          <div><b>{fmt(item.demand_lead_upper)}</b><span>if demand is high</span></div>
-          <div><b>{fmt(item.forecast_28)}</b><span>expected sales, 28 days</span></div>
-          <div><b>{fmt(item.eoq)}</b><span>reference EOQ (units)</span></div>
-          <div><b>{usd(item.order_cost)}</b><span>cost of suggested order</span></div>
-        </div>
-        <p className="sub" style={{ marginTop: 4 }}><b>Scenario status:</b> <Pill s={item.status} /> <b>Suggested order:</b> {item.order_qty ? `${fmt(item.order_qty)} units (${usd(item.order_cost)})` : 'none'} · Reorder point {fmt(item.rop)} units. {item.message}</p>
-        <p className="sub" style={{ marginTop: 2 }}>Stockout risk: <b>{item.stockout_risk}</b> — {fmt(item.stock)} units in stock vs {fmt(item.demand_lead)} expected before the next delivery, or {fmt(item.demand_lead_upper)} if demand runs high.</p>
-      </section>
-    </>
-  )
+        <div className="owner-assumption-result"><span>Estimated purchase cost</span><strong>{usd(detail.orderQty * detail.unitCost)}</strong></div>
+      </details>
+    </section>}
+
+    <details className="owner-financials"><summary>Financial overview</summary><div><span>Estimated purchase cost for recommended orders <strong>{usd(k.order_cost)}</strong></span><span>Expected sales over the next 7 days <strong>{usd(k.revenue_7)}</strong></span></div></details>
+  </main>;
 }

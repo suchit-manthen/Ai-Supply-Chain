@@ -17,7 +17,7 @@ from sklearn.isotonic import IsotonicRegression
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.stattools import acf
 from xgboost import XGBRegressor
-from config import HOLDOUT, HORIZON, FORECAST_INTERVAL_LEVEL, INTERVAL_Z
+from config import HOLDOUT, HORIZON, FORECAST_INTERVAL_LEVEL, INTERVAL_Z, PROPHET_YEARLY_MIN_DAYS
 
 warnings.filterwarnings("ignore")
 logging.getLogger("prophet").setLevel(logging.ERROR)
@@ -49,16 +49,51 @@ MODEL_INFO = {
 # Candidate algorithms, in evaluation order. Every SKU is tested against all of them.
 ALL_MODELS = ["ARIMA", "Prophet", "XGBoost", "Random Forest"]
 
-FEATS = ["dow", "month", "doy", "weekofyear", "is_weekend", "discount", "price", "temp", "holiday_lift"]
+# Calendar features are always available (derived from the date index).
+CAL_FEATS = ["dow", "month", "doy", "weekofyear", "is_weekend", "sin_doy", "cos_doy", "is_holiday"]
+# Optional exogenous drivers. Only the ones that actually vary are used, so a
+# missing/constant/zero column is dropped rather than fed as a meaningless 0.
+EXOG_CANDIDATES = ["discount", "price", "temp", "holiday_lift"]
+FEATS = CAL_FEATS + EXOG_CANDIDATES  # documented superset; _features returns the active subset
 
 
-def _features(d):
+def _varies(series):
+    """True when a column carries usable information (has values and varies)."""
+    s = pd.to_numeric(series, errors="coerce")
+    if not bool(s.notna().any()):
+        return False
+    spread = s.std(ddof=0)
+    return bool(spread is not None and not np.isnan(spread) and spread > 0)
+
+
+def available_exog(d):
+    """Optional drivers present in `d` that vary (and are therefore worth using)."""
+    return [c for c in EXOG_CANDIDATES if c in d.columns and _varies(d[c])]
+
+
+def _features(d, exog=None):
+    """Feature matrix: calendar terms plus the active optional drivers.
+
+    Passing a fixed `exog` list keeps train and predict columns aligned.
+    """
+    exog = available_exog(d) if exog is None else list(exog)
     x = pd.DataFrame(index=d.index)
-    x["dow"] = d.date.dt.dayofweek; x["month"] = d.date.dt.month; x["doy"] = d.date.dt.dayofyear
-    x["weekofyear"] = d.date.dt.isocalendar().week.astype(int); x["is_weekend"] = (x.dow >= 5).astype(int)
-    for c in ["discount", "price", "temp", "holiday_lift"]:
+    x["dow"] = d.date.dt.dayofweek
+    x["month"] = d.date.dt.month
+    x["doy"] = d.date.dt.dayofyear
+    x["weekofyear"] = d.date.dt.isocalendar().week.astype(int)
+    x["is_weekend"] = (x["dow"] >= 5).astype(int)
+    angle = 2 * np.pi * x["doy"] / 365.25
+    x["sin_doy"] = np.sin(angle)
+    x["cos_doy"] = np.cos(angle)
+    if "holiday_lift" in d.columns:
+        hl = pd.to_numeric(d["holiday_lift"], errors="coerce").fillna(0.0)
+    else:
+        hl = pd.Series(0.0, index=d.index)
+    x["is_holiday"] = (hl > 0).astype(int)
+    for c in exog:
         x[c] = d[c]
-    return x[FEATS]
+    return x
 
 
 def _metrics(y, p, naive):
@@ -136,13 +171,19 @@ def prediction_interval(preds, error_scale, z=INTERVAL_Z):
 
 # ---- individual algorithms: fit(train_df, predict_df) -> (pred, extras) --------------------------------------
 def fit_arima(tr, te):
-    m = SARIMAX(tr.sales.values, exog=tr[["discount"]].values, order=(2, 1, 1),
-                seasonal_order=(1, 0, 1, 7), enforce_stationarity=False, enforce_invertibility=False).fit(disp=False, maxiter=80)
-    f = m.get_forecast(len(te), exog=te[["discount"]].values)
+    exog = ["discount"] if ("discount" in tr.columns and _varies(tr["discount"])) else []
+    kwargs = dict(order=(2, 1, 1), seasonal_order=(1, 0, 1, 7),
+                  enforce_stationarity=False, enforce_invertibility=False)
+    if exog:
+        m = SARIMAX(tr.sales.values, exog=tr[exog].values, **kwargs).fit(disp=False, maxiter=80)
+        f = m.get_forecast(len(te), exog=te[exog].values)
+    else:
+        m = SARIMAX(tr.sales.values, **kwargs).fit(disp=False, maxiter=80)
+        f = m.get_forecast(len(te))
     resid = m.resid[14:]
     return f.predicted_mean, dict(
         order="(2,1,1)", seasonal_order="(1,0,1)[7]", aic=round(float(m.aic), 1), bic=round(float(m.bic), 1),
-        params={k: round(float(v), 3) for k, v in zip(m.param_names, m.params)},
+        params={k: round(float(v), 3) for k, v in zip(m.param_names, m.params)}, features_used=exog,
         acf=[round(float(v), 3) for v in acf(tr.sales.diff().dropna().values, nlags=21)],
         resid_acf=[round(float(v), 3) for v in acf(resid, nlags=21)],
         resid_std=round(float(np.std(resid)), 1))
@@ -150,44 +191,63 @@ def fit_arima(tr, te):
 
 def fit_prophet(tr, te, hol):
     from prophet import Prophet
-    m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False,
+    # With no yearly cycle to identify, the yearly Fourier fit is unstable and, in
+    # multiplicative mode, inflates the trend into wildly wrong forecasts. Only
+    # enable it once the training history spans at least two years.
+    span_days = int((tr["date"].max() - tr["date"].min()).days)
+    yearly = span_days >= PROPHET_YEARLY_MIN_DAYS
+    m = Prophet(yearly_seasonality=yearly, weekly_seasonality=True, daily_seasonality=False,
                 seasonality_mode="multiplicative", holidays=hol.assign(lower_window=-7, upper_window=1),
                 changepoint_prior_scale=.02, holidays_prior_scale=3, seasonality_prior_scale=5)
-    m.add_regressor("discount"); m.add_regressor("temp")
-    m.fit(tr.rename(columns={"date": "ds", "sales": "y"})[["ds", "y", "discount", "temp"]])
-    allx = pd.concat([tr, te]).rename(columns={"date": "ds"})[["ds", "discount", "temp"]]
+    regressors = [c for c in ("discount", "temp") if c in tr.columns and _varies(tr[c])]
+    for c in regressors:
+        m.add_regressor(c)
+    cols = ["ds", "y"] + regressors
+    m.fit(tr.rename(columns={"date": "ds", "sales": "y"})[cols])
+    allx = pd.concat([tr, te]).rename(columns={"date": "ds"})[["ds"] + regressors]
     fc = m.predict(allx)
     comp = fc.iloc[:len(tr)]
-    # reindex so short histories (missing weekdays/months) still produce a full component vector
-    dow = comp.assign(d=comp.ds.dt.dayofweek).groupby("d").weekly.mean().reindex(range(7)).fillna(0.0)
-    mon = comp.assign(mo=comp.ds.dt.month).groupby("mo").yearly.mean().reindex(range(1, 13)).fillna(0.0)
+    # reindex so short histories (missing weekdays/months) still produce a full component vector.
+    # A component column may be absent when that seasonality is disabled (e.g. yearly on short data).
+    if "weekly" in comp.columns:
+        dow = comp.assign(d=comp.ds.dt.dayofweek).groupby("d").weekly.mean().reindex(range(7)).fillna(0.0)
+    else:
+        dow = pd.Series(0.0, index=range(7))
+    if "yearly" in comp.columns:
+        mon = comp.assign(mo=comp.ds.dt.month).groupby("mo").yearly.mean().reindex(range(1, 13)).fillna(0.0)
+    else:
+        mon = pd.Series(0.0, index=range(1, 13))
     tail = fc.iloc[len(tr):]
     return tail.yhat.values, dict(
         trend=[dict(date=str(r.ds.date()), v=round(float(r.trend), 1)) for r in comp.iloc[::21].itertuples()],
         weekly=[round(float(dow[i]) * 100, 1) for i in range(7)],
         yearly=[round(float(mon[i]) * 100, 1) for i in range(1, 13)],
         holiday_effect=round(float(comp.holidays.abs().max()) * 100, 1),
-        changepoints=int(len(m.changepoints)), mode="multiplicative")
+        changepoints=int(len(m.changepoints)), mode="multiplicative", features_used=regressors)
 
 
 def fit_xgb(tr, te):
+    exog = available_exog(tr)
+    x_tr, x_te = _features(tr, exog), _features(te, exog)
     m = XGBRegressor(n_estimators=450, learning_rate=.04, max_depth=5, subsample=.85, colsample_bytree=.85,
                      min_child_weight=3, reg_lambda=2, random_state=1, n_jobs=2)
-    m.fit(_features(tr), tr.sales)
-    imp = sorted(zip(FEATS, m.feature_importances_), key=lambda t: -t[1])
-    return m.predict(_features(te)), dict(
+    m.fit(x_tr, tr.sales)
+    imp = sorted(zip(list(x_tr.columns), m.feature_importances_), key=lambda t: -t[1])
+    return m.predict(x_te), dict(
         params=dict(n_estimators=450, learning_rate=.04, max_depth=5, subsample=.85, colsample_bytree=.85),
-        importance=[dict(feature=k, value=round(float(v) * 100, 1)) for k, v in imp])
+        features_used=exog, importance=[dict(feature=k, value=round(float(v) * 100, 1)) for k, v in imp])
 
 
 def fit_rf(tr, te):
+    exog = available_exog(tr)
+    x_tr, x_te = _features(tr, exog), _features(te, exog)
     m = RandomForestRegressor(n_estimators=300, min_samples_leaf=3, max_features=.7, random_state=1, n_jobs=2)
-    m.fit(_features(tr), tr.sales)
-    imp = sorted(zip(FEATS, m.feature_importances_), key=lambda t: -t[1])
+    m.fit(x_tr, tr.sales)
+    imp = sorted(zip(list(x_tr.columns), m.feature_importances_), key=lambda t: -t[1])
     # spread across the individual trees = model uncertainty
-    X = _features(te); per_tree = np.stack([t.predict(X.values) for t in m.estimators_])
-    return m.predict(X), dict(
-        params=dict(n_estimators=300, min_samples_leaf=3, max_features=.7),
+    per_tree = np.stack([t.predict(x_te.values) for t in m.estimators_])
+    return m.predict(x_te), dict(
+        params=dict(n_estimators=300, min_samples_leaf=3, max_features=.7), features_used=exog,
         importance=[dict(feature=k, value=round(float(v) * 100, 1)) for k, v in imp],
         tree_spread=round(float(per_tree.std(axis=0).mean()), 1))
 
@@ -232,6 +292,7 @@ def forecast_product(algo, hist, fut, hol, folds=None):
     recent = hist.iloc[-90:]
     return dict(
         metrics=met, extras=extras,
+        feature_usage=dict(calendar=list(CAL_FEATS), exog=available_exog(hist)),
         interval_coverage=dict(covered=int(covered.sum()), total=int(len(covered)),
                                pct=round(float(covered.mean() * 100), 1), level=level),
         uncertainty=dict(method=method, level=level, z=z,

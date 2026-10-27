@@ -13,9 +13,11 @@ import db
 import data_upload
 from data_adapters import favorita, generic, store_family
 import monitoring
-from config import SERVICE_LEVEL, UPLOAD_MIN_TRAIN_DAYS
+import simulator
+from config import SERVICE_LEVEL, UPLOAD_MIN_TRAIN_DAYS, HOLDING_RATE, ORDERING_COST
 from inventory import service_z
 from pipeline import train
+from data import PRODUCTS
 from views import owner_view, analyst_view  # noqa: F401  re-exported for backwards compatibility
 
 app = Flask(__name__)
@@ -85,6 +87,94 @@ def status():
                        data_source=STATE["data_source"])
 
 
+def _simulator_items():
+    """Expose SKUs backed by the currently saved forecast; never fit models here."""
+    load_latest()
+    with LOCK:
+        owner = (STATE.get("data") or {}).get("owner")
+        source = STATE.get("data_source")
+    if not owner:
+        return None, source
+    definitions = {str(product["id"]): product for product in PRODUCTS}
+    items = []
+    for item in owner.get("items", []):
+        forecasts = [row.get("pred") for row in item.get("series", []) if row.get("pred") is not None]
+        if not forecasts:
+            continue
+        definition = definitions.get(str(item.get("id")), {})
+        price = float(item.get("price") or definition.get("price") or 1.0)
+        cost = float(item.get("cost") if item.get("cost") is not None else definition.get("cost", price * 0.7))
+        items.append({
+            "id": str(item["id"]), "name": item.get("name", str(item["id"])),
+            "category": item.get("category", "Unknown"), "forecast": forecasts,
+            "price": price, "cost": cost,
+            "price_assumed": source in ("favorita", "store_family") or not bool(item.get("price") or definition.get("price")),
+            "cost_assumed": source in ("generic", "uploaded", "store_family") or (item.get("cost") is None and definition.get("cost") is None),
+            "stock": float(item.get("stock", definition.get("base", 0) * definition.get("stock_days", 0))),
+            "on_order": float(item.get("on_order", definition.get("on_order", 0))),
+            "lead": int(item.get("lead", definition.get("lead", 3))),
+            "safety": float(item.get("safety", 0) or 0),
+            "max_cover": int(definition.get("max_cover", 14)),
+        })
+    return items, source
+
+
+@app.get("/api/simulator/catalog")
+def simulator_catalog():
+    items, source = _simulator_items()
+    if items is None:
+        return jsonify(ok=False, error="Train or load a saved forecast before opening the simulator."), 409
+    return jsonify(ok=True, source=source, horizons=list(simulator.HORIZONS),
+                   items=[{key: value for key, value in item.items() if key != "forecast"} for item in items],
+                   default_costs={"annual_holding_rate": HOLDING_RATE, "order_cost": ORDERING_COST})
+
+
+@app.post("/api/simulator/run")
+def simulator_run():
+    items, source = _simulator_items()
+    if items is None:
+        return jsonify(ok=False, error="Train or load a saved forecast before running a simulation."), 409
+    body = request.get_json(silent=True) or {}
+    selected = next((item for item in items if item["id"] == str(body.get("sku", ""))), None)
+    if selected is None:
+        return jsonify(ok=False, error="Choose an SKU from the saved forecast."), 400
+    try:
+        horizon = int(body.get("horizon", 30))
+        demand_multiplier = float(body.get("demand_multiplier", 1.0))
+        spike_pct = float(body.get("spike_pct", 0))
+        spike_day = int(body.get("spike_day", 1))
+        supplier_delay = int(body.get("supplier_delay", 0))
+        initial_stock_multiplier = float(body.get("initial_stock_multiplier", 1.0))
+        unit_price = float(body.get("unit_price", selected["price"]))
+        unit_cost = float(body.get("unit_cost", selected["cost"]))
+        annual_holding_rate = float(body.get("annual_holding_rate", HOLDING_RATE))
+        order_cost = float(body.get("order_cost", ORDERING_COST))
+        result = simulator.simulate(
+            forecast=selected["forecast"], item=selected, horizon=horizon,
+            demand_multiplier=demand_multiplier, spike_pct=spike_pct,
+            spike_day=spike_day, supplier_delay=supplier_delay,
+            initial_stock_multiplier=initial_stock_multiplier,
+            unit_price=unit_price, unit_cost=unit_cost,
+            annual_holding_rate=annual_holding_rate, order_cost=order_cost)
+    except (TypeError, ValueError, OverflowError) as e:
+        return jsonify(ok=False, error=str(e)), 400
+    return jsonify(ok=True, sku={"id": selected["id"], "name": selected["name"]},
+                   horizon=horizon, source=source, **result,
+                   assumptions={
+                       "baseline": {"demand_multiplier": 1.0, "spike_pct": 0,
+                                    "supplier_delay": 0, "initial_stock_multiplier": 1.0},
+                       "scenario": {"demand_multiplier": demand_multiplier,
+                                    "spike_pct": spike_pct, "spike_day": spike_day,
+                                    "supplier_delay": supplier_delay,
+                                    "initial_stock_multiplier": initial_stock_multiplier},
+                       "costs": {"unit_price": unit_price, "unit_cost": unit_cost,
+                                 "annual_holding_rate": annual_holding_rate,
+                                 "order_cost": order_cost,
+                                 "unit_price_assumed": selected["price_assumed"],
+                                 "unit_cost_assumed": selected["cost_assumed"]},
+                       "forecast_note": "Uses the saved 28-day model forecast; days beyond it repeat the last 7-day forecast pattern."})
+
+
 def _payload(key):
     load_latest()
     with LOCK:
@@ -144,28 +234,23 @@ def upload():
             return jsonify(ok=False, errors=[str(e)], warnings=[], detected={}, optional={}, preview=[])
         return jsonify(ok=True, adapter="store_family", dataset_id=dataset_id,
                        size_bytes=size, dataset=metadata)
-    # Anything that is not already canonical is profiled so the UI can map its
-    # columns (date + entity + sales required; everything else optional).
-    if not generic.canonical_required_present(header):
-        try:
-            dataset_id, path, size = generic.save_upload(f.stream)
-            prof = generic.profile(path)
-            generic.save_metadata(dataset_id, prof)
-        except Exception as e:
-            if "dataset_id" in locals():
-                generic.discard(dataset_id)
-            return jsonify(ok=False, errors=[str(e)], warnings=[], detected={}, optional={}, preview=[])
-        return jsonify(ok=True, adapter="generic", dataset_id=dataset_id, size_bytes=size,
-                       profile=prof, preview=prof.get("preview", []))
-    result = data_upload.process(f.read())
-    normalized = result.pop("normalized", None)
-    if not result.get("ok") or normalized is None:
-        return jsonify(result)
-    dataset_id = data_upload.new_dataset_id()
-    data_upload.save_dataset(dataset_id, normalized)
-    data_upload.save_meta(dataset_id, dict(detected=result["detected"], optional=result["optional"], warnings=result["warnings"]))
-    result["dataset_id"] = dataset_id
-    return jsonify(result)
+    # Every other CSV (including the canonical date/product/sales shape) is
+    # profiled so the UI can walk the user through mapping, quality and filters.
+    try:
+        dataset_id, path, size = generic.save_upload(f.stream)
+        prof = generic.profile(path)
+        if prof.get("required", {}).get("satisfied"):
+            try:
+                prof["quality"] = generic.inspect(path, prof.get("mapping"))  # full-file, chunked
+            except Exception:
+                prof["quality"] = None
+        generic.save_metadata(dataset_id, prof)
+    except Exception as e:
+        if "dataset_id" in locals():
+            generic.discard(dataset_id)
+        return jsonify(ok=False, errors=[str(e)], warnings=[], detected={}, optional={}, preview=[])
+    return jsonify(ok=True, adapter="generic", dataset_id=dataset_id, size_bytes=size,
+                   profile=prof, preview=prof.get("preview", []))
 
 
 @app.post("/api/favorita/upload")

@@ -11,7 +11,10 @@ from data import PRODUCTS
 from config import (HORIZON, HOLDOUT, N_FOLDS, SELECTION_METRIC, SELECTION_FALLBACK_METRIC,
                     LOW_DEMAND_THRESHOLD, SERVICE_LEVEL, Z, ORDERING_COST, HOLDING_RATE)
 import inventory
-from models import MODEL_INFO, ALL_MODELS
+from models import MODEL_INFO, ALL_MODELS, available_exog
+
+FEATURE_LABELS = {"discount": "discount %", "price": "shelf price",
+                  "temp": "temperature", "holiday_lift": "holiday lift"}
 
 
 def owner_view(res, hist, end, policy=None, products=None, data_source="synthetic"):
@@ -111,16 +114,24 @@ def analyst_view(res, hist, end, hol, data_quality=None, products=None, data_sou
             improvement=sel["improvement"], fallback_used=sel["fallback_used"], mean_demand=sel["mean_demand"],
             ranking=sel["ranking"], comparison=comparison, folds=folds,
             result=dict(metrics=r["metrics"], extras=r["extras"], uncertainty=r["uncertainty"],
+                        feature_usage=r.get("feature_usage"),
                         interval_coverage=r.get("interval_coverage"), backtest=r["backtest"], history=r["history"], forecast=r["forecast"], residuals=r["residuals"])))
     leaderboard = [dict(name=a, color=MODEL_INFO[a]["color"], aspect=MODEL_INFO[a]["aspect"], wins=win_counts[a],
                         avg_mape=round(float(np.mean(acc[a]["mape"])), 2), avg_rmse=round(float(np.mean(acc[a]["rmse"])), 1),
                         avg_naive=round(float(np.mean(acc[a]["naive"])), 2)) for a in ALL_MODELS]
+    # Only advertise optional drivers that are actually present and varying.
+    exog_used = available_exog(hist) if "date" in hist.columns else []
+    features = ["day of week", "month / day-of-year", "weekend flag", "holiday flag"] + [FEATURE_LABELS[c] for c in exog_used]
+    categories = []
+    if "category" in hist.columns:
+        totals = hist.groupby("category").sales.sum().sort_values(ascending=False)
+        categories = [dict(category=str(k), units=int(v)) for k, v in totals.items()]
     return dict(selection=dict(metric=SELECTION_METRIC, fallback=SELECTION_FALLBACK_METRIC,
                                low_demand_threshold=LOW_DEMAND_THRESHOLD, n_folds=folds_count),
                 algorithms=algorithms, leaderboard=leaderboard, win_counts=win_counts, skus=skus,
                 data_quality=data_quality or {}, data_source=data_source, holdout=HOLDOUT, horizon=HORIZON,
                 dataset=dict(rows=int(len(hist)), skus=len(products), start=str(hist.date.min().date()), end=str(end.date()),
-                             data_source=data_source,
-                             features=["day of week", "month / day-of-year", "weekend flag", "discount %", "shelf price", "temperature", "holiday lift"],
+                             data_source=data_source, features=features, optional_features=exog_used,
+                             categories=categories,
                              sample=hist.tail(8).assign(date=lambda d: d.date.dt.strftime("%Y-%m-%d")).round(2).to_dict("records"),
                              monthly=[dict(month=str(m), units=int(u)) for m, u in hist.groupby(hist.date.dt.to_period("M")).sales.sum().tail(24).items()]))

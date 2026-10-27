@@ -3,12 +3,13 @@ import pandas as pd
 import pytest
 
 from config import HORIZON
+from data import PRODUCTS
 import datasource
 
 
 def test_load_synthetic_shape_and_stockout_column():
     df, end, hol = datasource.load_synthetic(42)
-    assert df["product"].nunique() == 8
+    assert df["product"].nunique() == len(PRODUCTS)
     assert "stockout" in df.columns
     assert (df["stockout"] == 0).all()
     assert df[df.date > end].groupby("product").size().eq(HORIZON).all()
@@ -16,7 +17,7 @@ def test_load_synthetic_shape_and_stockout_column():
 
 def test_load_data_dispatch():
     df, end, _ = datasource.load_data(None)
-    assert df["product"].nunique() == 8
+    assert df["product"].nunique() == len(PRODUCTS)
     with pytest.raises(ValueError):
         datasource.load_data("nonsense.txt")
 
@@ -25,7 +26,7 @@ def test_validate_clean_history_is_ok():
     df, end, _ = datasource.load_synthetic(42)
     report = datasource.validate_sales(df[df.date <= end])
     assert report["ok"] is True
-    assert report["summary"]["rows"] == 8 * 3 * 365
+    assert report["summary"]["rows"] == len(PRODUCTS) * 3 * 365
     assert report["summary"]["negative_sales"] == 0
     assert report["summary"]["missing_skus"] == []
 
